@@ -22,71 +22,94 @@ namespace UMB.Model.Models
         {
             base.OnModelCreating(modelBuilder);
 
-            // Example constraints or relationships:
+            // User constraints
             modelBuilder.Entity<User>()
                 .HasIndex(u => u.Email)
                 .IsUnique();
 
+            // PlatformAccount constraints
             modelBuilder.Entity<PlatformAccount>()
                 .HasOne(pa => pa.User)
                 .WithMany(u => u.PlatformAccounts)
                 .HasForeignKey(pa => pa.UserId);
 
+            modelBuilder.Entity<PlatformAccount>()
+                .HasIndex(pa => new { pa.UserId, pa.PlatformType, pa.AccountIdentifier })
+                .IsUnique();
+
+            // MessageMetadata constraints
             modelBuilder.Entity<MessageMetadata>()
                 .HasOne(mm => mm.User)
                 .WithMany()
                 .HasForeignKey(mm => mm.UserId);
 
+            // TextProcessingLog constraints
             modelBuilder.Entity<TextProcessingLog>()
                 .HasOne(tpl => tpl.User)
                 .WithMany()
                 .HasForeignKey(tpl => tpl.UserId);
 
+            // MessageAttachment constraints
             modelBuilder.Entity<MessageAttachment>()
                 .HasOne(ma => ma.Message)
                 .WithMany(mm => mm.Attachments)
                 .HasForeignKey(ma => ma.MessageMetadataId)
                 .OnDelete(DeleteBehavior.Cascade);
 
-            modelBuilder.Entity<WhatsAppConnection>(entity =>
-            {
-                entity.HasKey(e => e.Id);
-                entity.Property(e => e.PhoneNumberId).IsRequired().HasMaxLength(100);
-                entity.Property(e => e.AccessToken).IsRequired().HasMaxLength(500);
-                entity.Property(e => e.PhoneNumber).IsRequired().HasMaxLength(20);
-                entity.Property(e => e.BusinessName).HasMaxLength(100);
-                entity.Property(e => e.IsConnected).HasDefaultValue(true);
+            // WhatsAppConnection constraints
+            modelBuilder.Entity<WhatsAppConnection>()
+                .HasKey(e => e.Id);
 
-                // Unique index on UserId since a user should only have one WhatsApp connection
-                entity.HasIndex(e => e.UserId).IsUnique();
+            modelBuilder.Entity<WhatsAppConnection>()
+                .Property(e => e.PhoneNumberId).IsRequired().HasMaxLength(100);
 
-                // Index on PhoneNumberId for faster webhook lookups
-                entity.HasIndex(e => e.PhoneNumberId);
+            modelBuilder.Entity<WhatsAppConnection>()
+                .Property(e => e.AccessToken).IsRequired().HasMaxLength(500);
 
-                // Configure relationship with User
-                entity.HasOne(e => e.User)
-                      .WithOne()
-                      .HasForeignKey<WhatsAppConnection>(e => e.UserId)
-                      .OnDelete(DeleteBehavior.Cascade);
-            });
+            modelBuilder.Entity<WhatsAppConnection>()
+                .Property(e => e.PhoneNumber).IsRequired().HasMaxLength(20);
 
-            modelBuilder.Entity<PlatformMessageSync>(entity =>
-            {
-                entity.HasKey(e => e.Id);
-                entity.Property(e => e.PlatformType).IsRequired().HasMaxLength(50);
+            modelBuilder.Entity<WhatsAppConnection>()
+                .Property(e => e.BusinessName).HasMaxLength(100);
 
-                // Create unique index for user + platform combination
-                entity.HasIndex(e => new { e.UserId, e.PlatformType }).IsUnique();
+            modelBuilder.Entity<WhatsAppConnection>()
+                .Property(e => e.IsConnected).HasDefaultValue(true);
 
-                // Configure relationship with User
-                entity.HasOne(e => e.User)
-                      .WithMany()
-                      .HasForeignKey(e => e.UserId)
-                      .OnDelete(DeleteBehavior.Cascade);
-            });
+            // Unique index on UserId and PhoneNumber
+            modelBuilder.Entity<WhatsAppConnection>()
+                .HasIndex(e => new { e.UserId, e.PhoneNumber })
+                .IsUnique();
+
+            // Index on PhoneNumberId for faster webhook lookups
+            modelBuilder.Entity<WhatsAppConnection>()
+                .HasIndex(e => e.PhoneNumberId);
+
+            // Configure relationship with User
+            modelBuilder.Entity<WhatsAppConnection>()
+                .HasOne(e => e.User)
+                .WithMany()
+                .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            // PlatformMessageSync constraints
+            modelBuilder.Entity<PlatformMessageSync>()
+                .HasKey(e => e.Id);
+
+            modelBuilder.Entity<PlatformMessageSync>()
+                .Property(e => e.PlatformType).IsRequired().HasMaxLength(50);
+
+            // Create unique index for user + platform combination
+            modelBuilder.Entity<PlatformMessageSync>()
+                .HasIndex(e => new { e.UserId, e.PlatformType })
+                .IsUnique();
+
+            modelBuilder.Entity<PlatformMessageSync>()
+                .HasOne(e => e.User)
+                .WithMany()
+                .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
         }
     }
-
     // Design-time factory for migrations
     public class AppDbContextFactory : IDesignTimeDbContextFactory<AppDbContext>
     {

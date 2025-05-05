@@ -1,10 +1,15 @@
 ﻿using Microsoft.EntityFrameworkCore;
-using UMB.Model.Models;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
-using Microsoft.Extensions.Logging;
-using System.Net.Http.Headers;
-using System.Text.Json.Serialization;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
+using UMB.Model.Models;
 
 namespace UMB.Api.Services.Integrations
 {
@@ -29,45 +34,43 @@ namespace UMB.Api.Services.Integrations
             _apiUrl = _config["WhatsAppSettings:ApiUrl"] ?? "https://graph.facebook.com/v18.0";
         }
 
-        // Validate WhatsApp credentials by making a simple API call
         public async Task<bool> ValidateCredentialsAsync(string phoneNumberId, string accessToken, string phoneNumber)
         {
             try
             {
-                // Create a temporary HttpClient with the provided token
                 using var tempClient = new HttpClient();
                 tempClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-
-                // Call a simple endpoint to verify credentials - use the business profile info endpoint
                 var response = await tempClient.GetAsync($"{_apiUrl}/{phoneNumberId}/whatsapp_business_profile");
-
-                // Return true if the call was successful
                 return response.IsSuccessStatusCode;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error validating WhatsApp credentials");
+                _logger.LogError(ex, "Error validating WhatsApp credentials for {PhoneNumber}", phoneNumber);
                 return false;
             }
         }
 
-        // Get messages from database
-        public async Task<List<MessageMetadata>> FetchMessagesAsync(int userId)
+        public async Task<List<MessageMetadata>> FetchMessagesAsync(int userId, string phoneNumber = null)
         {
             try
             {
-                // Check if user has a WhatsApp connection
-                var connection = await _dbContext.WhatsAppConnections
-                    .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected);
+                var query = _dbContext.WhatsAppConnections
+                    .Where(c => c.UserId == userId && c.IsConnected);
+                if (!string.IsNullOrEmpty(phoneNumber))
+                {
+                    query = query.Where(c => c.PhoneNumber == phoneNumber);
+                }
 
-                if (connection == null)
+                var connections = await query.ToListAsync();
+                if (!connections.Any())
                     return new List<MessageMetadata>();
 
-                // Get messages from our database
                 var messages = await _dbContext.MessageMetadatas
-                    .Where(m => m.UserId == userId && m.PlatformType == "WhatsApp")
+                    .Where(m => m.UserId == userId && m.PlatformType == "WhatsApp" &&
+                        connections.Select(c => c.PhoneNumber).Contains(m.AccountIdentifier))
+                    .Include(m => m.Attachments)
                     .OrderByDescending(m => m.ReceivedAt)
-                    .Take(50) // Limit to recent messages
+                    .Take(50)
                     .ToListAsync();
 
                 return messages;
@@ -79,31 +82,112 @@ namespace UMB.Api.Services.Integrations
             }
         }
 
-        // Send a WhatsApp text message
-        public async Task<string> SendMessageAsync(int userId, string message, string recipientPhoneNumber)
+        public async Task SendMessageAsync(int userId, string recipientPhoneNumber, string message, string phoneNumber, List<IFormFile> attachments = null)
         {
-            try
+            var connection = await _dbContext.WhatsAppConnections
+                .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected && c.PhoneNumber == phoneNumber);
+
+            if (connection == null)
+                throw new Exception($"No WhatsApp account connected for phone number {phoneNumber}.");
+
+            recipientPhoneNumber = FormatPhoneNumber(recipientPhoneNumber);
+
+            string messageId;
+            if (attachments != null && attachments.Any())
             {
-                var connection = await _dbContext.WhatsAppConnections
-                    .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected);
+                foreach (var attachment in attachments)
+                {
+                    using var content = new MultipartFormDataContent();
+                    using var stream = attachment.OpenReadStream();
+                    var fileContent = new StreamContent(stream);
+                    fileContent.Headers.ContentType = new MediaTypeHeaderValue(attachment.ContentType);
+                    content.Add(fileContent, "file", attachment.FileName);
 
-                if (connection == null)
-                    throw new Exception("No WhatsApp account connected.");
+                    _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", connection.AccessToken);
+                    var uploadResponse = await _httpClient.PostAsync($"{_apiUrl}/{connection.PhoneNumberId}/media", content);
 
-                // Format the recipient phone number to WhatsApp format if needed
-                recipientPhoneNumber = FormatPhoneNumber(recipientPhoneNumber);
+                    if (!uploadResponse.IsSuccessStatusCode)
+                    {
+                        var errorContent = await uploadResponse.Content.ReadAsStringAsync();
+                        throw new Exception($"Failed to upload WhatsApp media: {errorContent}");
+                    }
 
-                // Prepare message payload
+                    var uploadResult = JsonSerializer.Deserialize<WhatsAppMediaUploadResponse>(await uploadResponse.Content.ReadAsStringAsync());
+                    var mediaId = uploadResult.Id;
+
+                    //var mediaPayload = new
+                    //{
+                    //    messaging_product = "whatsapp",
+                    //    recipient_type = "individual",
+                    //    to = recipientPhoneNumber,
+                    //    type = GetMediaType(attachment.ContentType),
+                    //    [GetMediaType(attachment.ContentType)] = new Dictionary<string, string> { ["id"] = mediaId }
+                    //   // [GetMediaType(attachment.ContentType)] = new { id = mediaId }
+                    //};
+
+                    var mediaPayload = new Dictionary<string, object>
+                    {
+                        ["messaging_product"] = "whatsapp",
+                        ["recipient_type"] = "individual",
+                        ["to"] = recipientPhoneNumber,
+                        ["type"] = GetMediaType(attachment.ContentType),
+                        [GetMediaType(attachment.ContentType)] = new Dictionary<string, string> { ["id"] = mediaId }
+                    };
+                    var mediaContent = new StringContent(
+                        JsonSerializer.Serialize(mediaPayload),
+                        Encoding.UTF8,
+                        "application/json");
+
+                    var mediaResponse = await _httpClient.PostAsync($"{_apiUrl}/{connection.PhoneNumberId}/messages", mediaContent);
+
+                    if (!mediaResponse.IsSuccessStatusCode)
+                    {
+                        var errorContent = await mediaResponse.Content.ReadAsStringAsync();
+                        throw new Exception($"Failed to send WhatsApp media message: {errorContent}");
+                    }
+
+                    var responseContent = await mediaResponse.Content.ReadAsStringAsync();
+                    var responseObj = JsonSerializer.Deserialize<WhatsAppMessageResponse>(responseContent);
+                    messageId = responseObj?.Messages?.FirstOrDefault()?.Id ?? Guid.NewGuid().ToString();
+
+                    var attachmentMetadata = new MessageAttachment
+                    {
+                        FileName = attachment.FileName,
+                        ContentType = attachment.ContentType,
+                        Size = attachment.Length,
+                        AttachmentId = mediaId,
+                        Content = attachment.Length < 1024 * 1024 ? await ReadStreamToBytesAsync(attachment.OpenReadStream()) : null,
+                        CreatedAt = DateTime.UtcNow
+                    };
+
+                    var messageMetadata = new MessageMetadata
+                    {
+                        UserId = userId,
+                        PlatformType = "WhatsApp",
+                        ExternalMessageId = messageId,
+                        AccountIdentifier = connection.PhoneNumber,
+                        Subject = "WhatsApp Media Message",
+                        Snippet = $"[Media: {attachment.FileName}]",
+                        Body = $"[Media: {attachment.FileName}]",
+                        From = "You",
+                        ReceivedAt = DateTime.UtcNow,
+                        IsRead = true,
+                        HasAttachments = true,
+                        Attachments = new List<MessageAttachment> { attachmentMetadata }
+                    };
+
+                    _dbContext.MessageMetadatas.Add(messageMetadata);
+                }
+            }
+            else
+            {
                 var payload = new
                 {
                     messaging_product = "whatsapp",
                     recipient_type = "individual",
                     to = recipientPhoneNumber,
                     type = "text",
-                    text = new
-                    {
-                        body = message
-                    }
+                    text = new { body = message }
                 };
 
                 var content = new StringContent(
@@ -111,14 +195,8 @@ namespace UMB.Api.Services.Integrations
                     Encoding.UTF8,
                     "application/json");
 
-                // Create a new HttpClient for this request
-                using var client = new HttpClient();
-                client.DefaultRequestHeaders.Authorization =
-                    new AuthenticationHeaderValue("Bearer", connection.AccessToken);
-
-                var response = await client.PostAsync(
-                    $"{_apiUrl}/{connection.PhoneNumberId}/messages",
-                    content);
+                _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", connection.AccessToken);
+                var response = await _httpClient.PostAsync($"{_apiUrl}/{connection.PhoneNumberId}/messages", content);
 
                 if (!response.IsSuccessStatusCode)
                 {
@@ -128,117 +206,86 @@ namespace UMB.Api.Services.Integrations
 
                 var responseContent = await response.Content.ReadAsStringAsync();
                 var responseObj = JsonSerializer.Deserialize<WhatsAppMessageResponse>(responseContent);
+                messageId = responseObj?.Messages?.FirstOrDefault()?.Id ?? Guid.NewGuid().ToString();
 
-                var messageId = responseObj?.messages?.FirstOrDefault()?.id ?? Guid.NewGuid().ToString();
-
-                // Save to our database
                 var messageMetadata = new MessageMetadata
                 {
                     UserId = userId,
                     PlatformType = "WhatsApp",
                     ExternalMessageId = messageId,
+                    AccountIdentifier = connection.PhoneNumber,
                     Subject = "WhatsApp Message",
-                    Snippet = message,
+                    Snippet = message.Length > 100 ? message.Substring(0, 97) + "..." : message,
                     Body = message,
-                    From = "You", // Indicating it's an outgoing message
+                    From = "You",
                     ReceivedAt = DateTime.UtcNow,
-                    IsRead = true // Messages sent by the user are already read
+                    IsRead = true
                 };
 
                 _dbContext.MessageMetadatas.Add(messageMetadata);
-                await _dbContext.SaveChangesAsync();
+            }
 
-                return messageId;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error sending WhatsApp message for user {UserId}", userId);
-                throw;
-            }
+            await _dbContext.SaveChangesAsync();
         }
 
-        // Send a WhatsApp template message
-        public async Task<string> SendTemplateMessageAsync(int userId, string recipientPhoneNumber, string templateName, string languageCode)
+        public async Task<string> SendTemplateMessageAsync(int userId, string recipientPhoneNumber, string templateName, string languageCode, string phoneNumber)
         {
-            try
+            var connection = await _dbContext.WhatsAppConnections
+                .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected && c.PhoneNumber == phoneNumber);
+
+            if (connection == null)
+                throw new Exception($"No WhatsApp account connected for phone number {phoneNumber}.");
+
+            recipientPhoneNumber = FormatPhoneNumber(recipientPhoneNumber);
+            var payload = new
             {
-                var connection = await _dbContext.WhatsAppConnections
-                    .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected);
-
-                if (connection == null)
-                    throw new Exception("No WhatsApp account connected.");
-
-                // Format the recipient phone number to WhatsApp format if needed
-                recipientPhoneNumber = FormatPhoneNumber(recipientPhoneNumber);
-
-                // Prepare message payload for template
-                var payload = new
+                messaging_product = "whatsapp",
+                to = recipientPhoneNumber,
+                type = "template",
+                template = new
                 {
-                    messaging_product = "whatsapp",
-                    to = recipientPhoneNumber,
-                    type = "template",
-                    template = new
-                    {
-                        name = templateName,
-                        language = new
-                        {
-                            code = languageCode
-                        }
-                    }
-                };
-
-                var content = new StringContent(
-                    JsonSerializer.Serialize(payload),
-                    Encoding.UTF8,
-                    "application/json");
-
-                // Create a new HttpClient for this request
-                using var client = new HttpClient();
-                client.DefaultRequestHeaders.Authorization =
-                    new AuthenticationHeaderValue("Bearer", connection.AccessToken);
-
-                var response = await client.PostAsync(
-                    $"{_apiUrl}/{connection.PhoneNumberId}/messages",
-                    content);
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    var errorContent = await response.Content.ReadAsStringAsync();
-                    throw new Exception($"Failed to send WhatsApp template message: {errorContent}");
+                    name = templateName,
+                    language = new { code = languageCode }
                 }
+            };
 
-                var responseContent = await response.Content.ReadAsStringAsync();
-                var responseObj = JsonSerializer.Deserialize<WhatsAppMessageResponse>(responseContent);
+            var content = new StringContent(
+                JsonSerializer.Serialize(payload),
+                Encoding.UTF8,
+                "application/json");
 
-                var messageId = responseObj?.messages?.FirstOrDefault()?.id ?? Guid.NewGuid().ToString();
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", connection.AccessToken);
+            var response = await _httpClient.PostAsync($"{_apiUrl}/{connection.PhoneNumberId}/messages", content);
 
-                // Save to our database
-                var messageMetadata = new MessageMetadata
-                {
-                    UserId = userId,
-                    PlatformType = "WhatsApp",
-                    ExternalMessageId = messageId,
-                    Subject = "WhatsApp Template Message",
-                    Snippet = $"Template: {templateName}",
-                    Body = $"Template: {templateName}",
-                    From = "You", // Indicating it's an outgoing message
-                    ReceivedAt = DateTime.UtcNow,
-                    IsRead = true // Messages sent by the user are already read
-                };
-
-                _dbContext.MessageMetadatas.Add(messageMetadata);
-                await _dbContext.SaveChangesAsync();
-
-                return messageId;
-            }
-            catch (Exception ex)
+            if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError(ex, "Error sending WhatsApp template message for user {UserId}", userId);
-                throw;
+                var errorContent = await response.Content.ReadAsStringAsync();
+                throw new Exception($"Failed to send WhatsApp template message: {errorContent}");
             }
+
+            var responseContent = await response.Content.ReadAsStringAsync();
+            var responseObj = JsonSerializer.Deserialize<WhatsAppMessageResponse>(responseContent);
+            var messageId = responseObj?.Messages?.FirstOrDefault()?.Id ?? Guid.NewGuid().ToString();
+
+            var messageMetadata = new MessageMetadata
+            {
+                UserId = userId,
+                PlatformType = "WhatsApp",
+                ExternalMessageId = messageId,
+                AccountIdentifier = connection.PhoneNumber,
+                Subject = "WhatsApp Template Message",
+                Snippet = $"Template: {templateName}",
+                Body = $"Template: {templateName}",
+                From = "You",
+                ReceivedAt = DateTime.UtcNow,
+                IsRead = true
+            };
+
+            _dbContext.MessageMetadatas.Add(messageMetadata);
+            await _dbContext.SaveChangesAsync();
+            return messageId;
         }
 
-        // Process a message received via webhook
         public async Task ProcessIncomingMessageAsync(WhatsAppFullWebhookPayload payload)
         {
             try
@@ -257,268 +304,288 @@ namespace UMB.Api.Services.Integrations
             }
         }
 
-        // Process a single WhatsApp message change
-        public async Task ProcessWhatsAppMessageChangeAsync(WhatsAppChange change)
+        private async Task ProcessWhatsAppMessageChangeAsync(WhatsAppChange change)
         {
-            try
+            if (change?.Field != "messages" || change.Value?.Messages == null)
+                return;
+
+            var phoneNumberId = change.Value.Metadata?.PhoneNumberId;
+            if (string.IsNullOrEmpty(phoneNumberId))
+                return;
+
+            var connection = await _dbContext.WhatsAppConnections
+                .FirstOrDefaultAsync(c => c.PhoneNumberId == phoneNumberId && c.IsConnected);
+
+            if (connection == null)
             {
-                if (change?.Field != "messages" || change.Value?.Messages == null)
-                    return;
+                _logger.LogWarning("No user found for WhatsApp phone number ID: {PhoneNumberId}", phoneNumberId);
+                return;
+            }
 
-                var phoneNumberId = change.Value.Metadata?.PhoneNumberId;
-                if (string.IsNullOrEmpty(phoneNumberId))
-                    return;
+            foreach (var message in change.Value.Messages)
+            {
+                var existingMessage = await _dbContext.MessageMetadatas
+                    .AnyAsync(m => m.ExternalMessageId == message.Id);
 
-                // Find the user associated with this phone number ID
-                var connection = await _dbContext.WhatsAppConnections
-                    .FirstOrDefaultAsync(c => c.PhoneNumberId == phoneNumberId && c.IsConnected);
-
-                if (connection == null)
+                if (existingMessage)
                 {
-                    _logger.LogWarning("No user found for WhatsApp phone number ID: {PhoneNumberId}", phoneNumberId);
-                    return;
+                    _logger.LogInformation("Skipping already processed message: {MessageId}", message.Id);
+                    continue;
                 }
 
-                foreach (var message in change.Value.Messages)
+                var contact = change.Value.Contacts?.FirstOrDefault();
+                var contactName = contact?.Profile?.Name ?? message.From;
+
+                var messageMetadata = new MessageMetadata
                 {
-                    // Skip if we've already processed this message
-                    var existingMessage = await _dbContext.MessageMetadatas
-                        .AnyAsync(m => m.ExternalMessageId == message.Id);
-
-                    if (existingMessage)
-                    {
-                        _logger.LogInformation("Skipping already processed message: {MessageId}", message.Id);
-                        continue;
-                    }
-
-                    // Get contact info for the sender
-                    var contact = change.Value.Contacts?.FirstOrDefault();
-                    var contactName = contact?.Profile?.Name ?? message.From;
-
-                    // Create a message metadata
-                    var messageMetadata = new MessageMetadata
-                    {
-                        UserId = connection.UserId,
-                        PlatformType = "WhatsApp",
-                        ExternalMessageId = message.Id,
-                        Subject = "WhatsApp Message",
-                        Snippet = message.Text?.Body ?? "[Media Message]",
-                        Body = message.Text?.Body ?? "[Media Message]",
-                        From = contactName,
-                        fromNumber = message.From,
-                        ReceivedAt = DateTimeOffset.FromUnixTimeSeconds(long.Parse(message.Timestamp)).DateTime,
-                        IsRead = false
-                    };
-
-                    // Save to database
-                    _dbContext.MessageMetadatas.Add(messageMetadata);
-                }
-
-                await _dbContext.SaveChangesAsync();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error processing WhatsApp message change: {Message}", ex.Message);
-            }
-        }
-        // Mark a message as read
-        public async Task MarkMessageAsReadAsync(int userId, string messageId)
-        {
-            try
-            {
-                // Find the message in the database
-                var message = await _dbContext.MessageMetadatas
-                    .FirstOrDefaultAsync(m => m.UserId == userId && m.ExternalMessageId == messageId);
-
-                if (message == null)
-                    throw new Exception($"Message with ID {messageId} not found");
-
-                // Update the read status in our database
-                message.IsRead = true;
-                await _dbContext.SaveChangesAsync();
-
-                // Get the connection details
-                var connection = await _dbContext.WhatsAppConnections
-                    .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected);
-
-                if (connection == null)
-                    return; // No need to update on WhatsApp API if connection is not available
-
-                // Send mark as read to WhatsApp API
-                var markReadRequest = new
-                {
-                    messaging_product = "whatsapp",
-                    status = "read",
-                    message_id = messageId
+                    UserId = connection.UserId,
+                    PlatformType = "WhatsApp",
+                    ExternalMessageId = message.Id,
+                    AccountIdentifier = connection.PhoneNumber,
+                    Subject = "WhatsApp Message",
+                    Snippet = message.Text?.Body ?? "[Media Message]",
+                    Body = message.Text?.Body ?? "[Media Message]",
+                    From = contactName,
+                    //FromNumber = message.From,
+                    ReceivedAt = DateTimeOffset.FromUnixTimeSeconds(long.Parse(message.Timestamp)).DateTime,
+                    IsRead = false
                 };
 
-                var content = new StringContent(
-                    JsonSerializer.Serialize(markReadRequest),
-                    Encoding.UTF8,
-                    "application/json");
+                if (message.Type == "image" || message.Type == "video" || message.Type == "audio" || message.Type == "document")
+                {
+                    messageMetadata.HasAttachments = true;
+                    var attachment = new MessageAttachment
+                    {
+                        AttachmentId = message.Image?.Id ?? message.Video?.Id ?? message.Audio?.Id ?? message.Document?.Id,
+                        FileName = message.Document?.Filename ?? $"media_{message.Id}",
+                        ContentType = message.Document?.MimeType ?? GetMimeType(message.Type),
+                        Size = 0, // Size not provided in webhook
+                        CreatedAt = DateTime.UtcNow
+                    };
+                    messageMetadata.Attachments = new List<MessageAttachment> { attachment };
+                }
 
-                // Create a new HttpClient for this request
-                using var client = new HttpClient();
-                client.DefaultRequestHeaders.Authorization =
-                    new AuthenticationHeaderValue("Bearer", connection.AccessToken);
+                _dbContext.MessageMetadatas.Add(messageMetadata);
+            }
 
-                await client.PostAsync(
-                    $"{_apiUrl}/{connection.PhoneNumberId}/messages",
-                    content);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error marking WhatsApp message as read: {MessageId}", messageId);
-                throw;
-            }
+            await _dbContext.SaveChangesAsync();
         }
 
-        // Helper to format phone number for WhatsApp API
-        private string FormatPhoneNumber(string phoneNumber)
+        public async Task MarkMessageAsReadAsync(int userId, string messageId, string phoneNumber)
         {
-            // Remove any non-digit characters
-            var digitsOnly = new string(phoneNumber.Where(char.IsDigit).ToArray());
+            var message = await _dbContext.MessageMetadatas
+                .FirstOrDefaultAsync(m => m.UserId == userId && m.ExternalMessageId == messageId && m.AccountIdentifier == phoneNumber);
 
-            // Ensure it has country code
-            if (!digitsOnly.StartsWith("1") && digitsOnly.Length == 10)
+            if (message == null)
+                throw new Exception($"Message with ID {messageId} not found");
+
+            message.IsRead = true;
+            await _dbContext.SaveChangesAsync();
+
+            var connection = await _dbContext.WhatsAppConnections
+                .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected && c.PhoneNumber == phoneNumber);
+
+            if (connection == null)
+                return;
+
+            var markReadRequest = new
             {
-                // Assume US number and add +1
-                return $"+1{digitsOnly}";
+                messaging_product = "whatsapp",
+                status = "read",
+                message_id = messageId
+            };
+
+            var content = new StringContent(
+                JsonSerializer.Serialize(markReadRequest),
+                Encoding.UTF8,
+                "application/json");
+
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", connection.AccessToken);
+            await _httpClient.PostAsync($"{_apiUrl}/{connection.PhoneNumberId}/messages", content);
+        }
+
+        public async Task<(byte[] Content, string ContentType, string FileName)> GetAttachmentAsync(int userId, string messageId, string attachmentId, string phoneNumber)
+        {
+            var message = await _dbContext.MessageMetadatas
+                .Include(m => m.Attachments)
+                .FirstOrDefaultAsync(m => m.UserId == userId && m.ExternalMessageId == messageId && m.AccountIdentifier == phoneNumber);
+
+            if (message == null)
+                throw new Exception($"Message with ID {messageId} not found");
+
+            var attachment = message.Attachments?.FirstOrDefault(a => a.AttachmentId == attachmentId);
+            if (attachment == null)
+                throw new Exception($"Attachment with ID {attachmentId} not found");
+
+            if (attachment.Content != null)
+            {
+                return (attachment.Content, attachment.ContentType, attachment.FileName);
             }
 
+            var connection = await _dbContext.WhatsAppConnections
+                .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected && c.PhoneNumber == phoneNumber);
+
+            if (connection == null)
+                throw new Exception($"No WhatsApp account connected for phone number {phoneNumber}.");
+
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", connection.AccessToken);
+            var mediaResponse = await _httpClient.GetAsync($"{_apiUrl}/{attachmentId}");
+
+            if (!mediaResponse.IsSuccessStatusCode)
+            {
+                var errorContent = await mediaResponse.Content.ReadAsStringAsync();
+                throw new Exception($"Failed to retrieve WhatsApp media: {errorContent}");
+            }
+
+            var mediaInfo = JsonSerializer.Deserialize<WhatsAppMediaResponse>(await mediaResponse.Content.ReadAsStringAsync());
+            var mediaUrl = mediaInfo.Url;
+
+            var contentResponse = await _httpClient.GetAsync(mediaUrl);
+            if (!contentResponse.IsSuccessStatusCode)
+            {
+                var errorContent = await contentResponse.Content.ReadAsStringAsync();
+                throw new Exception($"Failed to download WhatsApp media: {errorContent}");
+            }
+
+            var content = await contentResponse.Content.ReadAsByteArrayAsync();
+            if (content.Length < 1024 * 1024)
+            {
+                attachment.Content = content;
+                await _dbContext.SaveChangesAsync();
+            }
+
+            return (content, attachment.ContentType, attachment.FileName);
+        }
+
+        private string FormatPhoneNumber(string phoneNumber)
+        {
+            var digitsOnly = new string(phoneNumber.Where(char.IsDigit).ToArray());
+            if (!digitsOnly.StartsWith("1") && digitsOnly.Length == 10)
+            {
+                return $"+1{digitsOnly}";
+            }
             if (!digitsOnly.StartsWith("+"))
             {
                 return $"+{digitsOnly}";
             }
-
             return digitsOnly;
         }
 
-        private string GetSenderName(List<WhatsAppContact> contacts)
+        private string GetMediaType(string contentType)
         {
-            if (contacts == null || contacts.Count == 0) return "Unknown";
+            if (contentType.StartsWith("image")) return "image";
+            if (contentType.StartsWith("video")) return "video";
+            if (contentType.StartsWith("audio")) return "audio";
+            return "document";
+        }
 
-            var contact = contacts[0];
-            return contact.Profile?.Name ?? contact.WaId ?? "Unknown";
+        private string GetMimeType(string type)
+        {
+            return type switch
+            {
+                "image" => "image/jpeg",
+                "video" => "video/mp4",
+                "audio" => "audio/mp3",
+                "document" => "application/pdf",
+                _ => "application/octet-stream"
+            };
+        }
+
+        private async Task<byte[]> ReadStreamToBytesAsync(Stream stream)
+        {
+            using var memoryStream = new MemoryStream();
+            await stream.CopyToAsync(memoryStream);
+            return memoryStream.ToArray();
         }
     }
 
-    // DTO classes for JSON responses
+    public class WhatsAppMessageResponse
+    {
+        public List<WhatsAppMessage> Messages { get; set; }
+    }
+
+    public class WhatsAppMessage
+    {
+        public string Id { get; set; }
+    }
+
+    public class WhatsAppMediaUploadResponse
+    {
+        public string Id { get; set; }
+    }
+
+    public class WhatsAppMediaResponse
+    {
+        public string Url { get; set; }
+        public string MimeType { get; set; }
+        public string Id { get; set; }
+    }
+
     public class WhatsAppFullWebhookPayload
     {
-        [JsonPropertyName("object")]
         public string Object { get; set; }
-
-        [JsonPropertyName("entry")]
         public List<WhatsAppEntry> Entry { get; set; }
     }
 
     public class WhatsAppEntry
     {
-        [JsonPropertyName("id")]
         public string Id { get; set; }
-
-        [JsonPropertyName("changes")]
         public List<WhatsAppChange> Changes { get; set; }
     }
 
     public class WhatsAppChange
     {
-        [JsonPropertyName("field")]
         public string Field { get; set; }
-
-        [JsonPropertyName("value")]
-        public WhatsAppValue Value { get; set; }
+        public WhatsAppChangeValue Value { get; set; }
     }
 
-    public class WhatsAppValue
+    public class WhatsAppChangeValue
     {
-        [JsonPropertyName("messaging_product")]
         public string MessagingProduct { get; set; }
-
-        [JsonPropertyName("metadata")]
         public WhatsAppMetadata Metadata { get; set; }
-
-        [JsonPropertyName("contacts")]
         public List<WhatsAppContact> Contacts { get; set; }
-
-        [JsonPropertyName("messages")]
-        public List<WhatsAppMessage> Messages { get; set; }
+        public List<WhatsAppWebhookMessage> Messages { get; set; }
     }
 
     public class WhatsAppMetadata
     {
-        [JsonPropertyName("display_phone_number")]
         public string DisplayPhoneNumber { get; set; }
-
-        [JsonPropertyName("phone_number_id")]
         public string PhoneNumberId { get; set; }
     }
 
     public class WhatsAppContact
     {
-        [JsonPropertyName("profile")]
         public WhatsAppProfile Profile { get; set; }
-
-        [JsonPropertyName("wa_id")]
         public string WaId { get; set; }
     }
 
     public class WhatsAppProfile
     {
-        [JsonPropertyName("name")]
         public string Name { get; set; }
     }
 
-    public class WhatsAppMessage
+    public class WhatsAppWebhookMessage
     {
-        [JsonPropertyName("from")]
         public string From { get; set; }
-
-        [JsonPropertyName("id")]
         public string Id { get; set; }
-
-        [JsonPropertyName("timestamp")]
         public string Timestamp { get; set; }
-
-        [JsonPropertyName("type")]
         public string Type { get; set; }
-
-        [JsonPropertyName("text")]
-        public WhatsAppMessageText Text { get; set; }
+        public WhatsAppText Text { get; set; }
+        public WhatsAppMedia Image { get; set; }
+        public WhatsAppMedia Video { get; set; }
+        public WhatsAppMedia Audio { get; set; }
+        public WhatsAppMedia Document { get; set; }
     }
 
-    public class WhatsAppMessageText
+    public class WhatsAppText
     {
-        [JsonPropertyName("body")]
         public string Body { get; set; }
     }
 
-    // Message response model
-    public class WhatsAppMessageResponse
+    public class WhatsAppMedia
     {
-        [JsonPropertyName("messaging_product")]
-        public string messaging_product { get; set; }
-
-        [JsonPropertyName("contacts")]
-        public List<WhatsAppResponseContact> contacts { get; set; }
-
-        [JsonPropertyName("messages")]
-        public List<WhatsAppResponseMessage> messages { get; set; }
-
-        public class WhatsAppResponseContact
-        {
-            [JsonPropertyName("input")]
-            public string input { get; set; }
-
-            [JsonPropertyName("wa_id")]
-            public string wa_id { get; set; }
-        }
-
-        public class WhatsAppResponseMessage
-        {
-            [JsonPropertyName("id")]
-            public string id { get; set; }
-        }
+        public string Id { get; set; }
+        public string MimeType { get; set; }
+        public string Filename { get; set; }
     }
 }

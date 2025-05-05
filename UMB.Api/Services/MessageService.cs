@@ -1,301 +1,181 @@
-﻿using Microsoft.AspNetCore.Http;
+﻿using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
 using UMB.Api.Services.Integrations;
 using UMB.Model.Models;
-using Microsoft.EntityFrameworkCore;
 
 namespace UMB.Api.Services
 {
     public class MessageService : IMessageService
     {
-        private readonly IGmailIntegrationService _gmail;
-        private readonly ILinkedInIntegrationService _linkedin;
-        private readonly IOutlookIntegrationService _outlook;
-        private readonly IWhatsAppIntegrationService _whatsapp;
         private readonly AppDbContext _dbContext;
-        private readonly ILogger<MessageService> _logger;
-
-        // Configure how frequently to refresh messages from external APIs
-        private readonly TimeSpan _refreshThreshold = TimeSpan.FromMinutes(0.5);
+        private readonly IGmailIntegrationService _gmailIntegration;
+        private readonly ILinkedInIntegrationService _linkedinIntegration;
+        private readonly IOutlookIntegrationService _outlookIntegration;
+        private readonly IWhatsAppIntegrationService _whatsAppIntegration;
 
         public MessageService(
-            IGmailIntegrationService gmail,
-            ILinkedInIntegrationService linkedin,
-            IOutlookIntegrationService outlook,
-            IWhatsAppIntegrationService whatsapp,
             AppDbContext dbContext,
-            ILogger<MessageService> logger)
+            IGmailIntegrationService gmailIntegration,
+            ILinkedInIntegrationService linkedinIntegration,
+            IOutlookIntegrationService outlookIntegration,
+            IWhatsAppIntegrationService whatsAppIntegration)
         {
-            _gmail = gmail;
-            _linkedin = linkedin;
-            _outlook = outlook;
-            _whatsapp = whatsapp;
             _dbContext = dbContext;
-            _logger = logger;
+            _gmailIntegration = gmailIntegration;
+            _linkedinIntegration = linkedinIntegration;
+            _outlookIntegration = outlookIntegration;
+            _whatsAppIntegration = whatsAppIntegration;
         }
 
-        public async Task<List<MessageMetadata>> GetConsolidatedMessages(
-            int userId, bool? unread, string? platform)
+        public async Task<List<MessageMetadata>> GetConsolidatedMessages(int userId, bool? unread = null, string platform = null)
         {
-            // Get all connected platforms for the user
-            var platformAccounts = await _dbContext.PlatformAccounts
-                .Where(pa => pa.UserId == userId)
-                .ToListAsync();
+            var messages = new List<MessageMetadata>();
 
-            // Check for WhatsApp connection separately (if we're using separate tables)
-            var whatsAppConnection = await _dbContext.WhatsAppConnections
-                .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected);
+            // Fetch messages from database
+            var query = _dbContext.MessageMetadatas
+                .Where(m => m.UserId == userId);
 
-            bool hasWhatsApp = whatsAppConnection != null;
-
-            // Initialize result list
-            var allMessages = new List<MessageMetadata>();
-
-            // Track when messages were last synced for each platform
-            var lastSyncTimes = await GetLastSyncTimesForUser(userId);
-
-            // Process each platform account
-            foreach (var account in platformAccounts)
+            if (!string.IsNullOrEmpty(platform))
             {
-                // Skip if we're filtering by platform and this isn't the one
-                if (platform != null && !account.PlatformType.Equals(platform, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                // Get messages for this platform
-                var platformMessages = await GetMessagesForPlatform(
-                    userId,
-                    account.PlatformType,
-                    lastSyncTimes.GetValueOrDefault(account.PlatformType));
-
-                // Apply unread filter if specified
-                if (unread.HasValue)
-                {
-                    platformMessages = platformMessages.Where(m => m.IsRead != unread.Value).ToList();
-                }
-
-                allMessages.AddRange(platformMessages);
+                query = query.Where(m => m.PlatformType == platform);
             }
 
-            // Sort by received date descending
-            return allMessages.OrderByDescending(m => m.ReceivedAt).ToList();
-        }
-
-        private async Task<Dictionary<string, DateTime>> GetLastSyncTimesForUser(int userId)
-        {
-            // Query platform message sync records
-            var syncRecords = await _dbContext.PlatformMessageSyncs
-                .Where(sync => sync.UserId == userId)
-                .ToListAsync();
-
-            // Build dictionary of platform -> lastSyncTime
-            var syncTimes = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
-            foreach (var record in syncRecords)
+            if (unread.HasValue)
             {
-                syncTimes[record.PlatformType] = record.LastSyncTime;
+                query = query.Where(m => m.IsRead == !unread.Value);
             }
 
-            return syncTimes;
-        }
-
-        private async Task<List<MessageMetadata>> GetMessagesForPlatform(
-            int userId, string platformType, DateTime lastSyncTime)
-        {
-            // Get messages from database - include attachments
-            var dbMessages = await _dbContext.MessageMetadatas
+            var dbMessages = await query
                 .Include(m => m.Attachments)
-                .Where(m => m.UserId == userId && m.PlatformType == platformType)
                 .OrderByDescending(m => m.ReceivedAt)
-                .Take(100) // Limit to reasonable number
                 .ToListAsync();
 
-            // Check if we need to refresh from API
-            bool shouldRefresh = ShouldRefreshMessages(lastSyncTime, platformType);
+            messages.AddRange(dbMessages);
 
-            if (shouldRefresh)
+            // Fetch new messages from platforms
+            var platforms = await _dbContext.PlatformAccounts
+                .Where(pa => pa.UserId == userId)
+                .Select(pa => pa.PlatformType)
+                .Distinct()
+                .ToListAsync();
+
+            if (string.IsNullOrEmpty(platform))
             {
-                _logger.LogInformation("Refreshing messages for user {UserId} from {Platform}", userId, platformType);
+                platforms.Add("WhatsApp"); // Include WhatsApp if no specific platform is specified
+            }
+            else if (platform.Equals("WhatsApp", StringComparison.OrdinalIgnoreCase))
+            {
+                platforms = new List<string> { "WhatsApp" };
+            }
+            else
+            {
+                platforms = new List<string> { platform };
+            }
 
+            foreach (var plat in platforms)
+            {
                 try
                 {
-                    // Fetch fresh messages from the appropriate service
-                    List<MessageMetadata> freshMessages = await FetchMessagesFromService(userId, platformType);
-
-                    if (freshMessages.Any())
+                    switch (plat.ToLower())
                     {
-                        // Update last sync time
-                        await UpdateLastSyncTime(userId, platformType);
-
-                        // Merge with existing messages, eliminating duplicates
-                        return MergeMessageLists(freshMessages, dbMessages);
+                        case "gmail":
+                            messages.AddRange(await _gmailIntegration.FetchMessagesAsync(userId));
+                            break;
+                        case "linkedin":
+                            messages.AddRange(await _linkedinIntegration.FetchMessagesAsync(userId));
+                            break;
+                        case "outlook":
+                            messages.AddRange(await _outlookIntegration.FetchMessagesAsync(userId));
+                            break;
+                        case "whatsapp":
+                            messages.AddRange(await _whatsAppIntegration.FetchMessagesAsync(userId));
+                            break;
                     }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error refreshing messages for {Platform}", platformType);
-                    // Fall back to database messages on error
+                    // Log error and continue with other platforms
+                    Console.WriteLine($"Error fetching messages for {plat}: {ex.Message}");
                 }
             }
 
-            // Return database messages if no refresh was needed or if refresh failed
-            return dbMessages;
+            // Remove duplicates based on ExternalMessageId and keep the latest
+            messages = messages
+                .GroupBy(m => new { m.ExternalMessageId, m.AccountIdentifier })
+                .Select(g => g.OrderByDescending(m => m.ReceivedAt).First())
+                .OrderByDescending(m => m.ReceivedAt)
+                .ToList();
+
+            return messages;
         }
 
-        private bool ShouldRefreshMessages(DateTime lastSyncTime, string platformType)
-        {
-            // Always refresh if we've never synced before
-            if (lastSyncTime == default)
-                return true;
-
-            // Don't refresh WhatsApp from API as we get updates via webhook
-            if (platformType.Equals("WhatsApp", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            // Check if we've passed the refresh threshold
-            return DateTime.UtcNow - lastSyncTime > _refreshThreshold;
-        }
-
-        private async Task<List<MessageMetadata>> FetchMessagesFromService(int userId, string platformType)
-        {
-            // Call the appropriate service based on platform type
-            return platformType.ToLower() switch
-            {
-                "gmail" => await _gmail.FetchMessagesAsync(userId),
-                "linkedin" => await _linkedin.FetchMessagesAsync(userId),
-                "outlook" => await _outlook.FetchMessagesAsync(userId),
-                "whatsapp" => await _whatsapp.FetchMessagesAsync(userId),
-                _ => new List<MessageMetadata>()
-            };
-        }
-
-        public async Task SendMessage(int userId, string platform, string subject, string body, string to, List<IFormFile> attachments = null)
+        public async Task SendMessage(int userId, string platform, string subject, string body, string to, string accountIdentifier, List<IFormFile> attachments = null)
         {
             switch (platform.ToLower())
             {
                 case "gmail":
-                    await _gmail.SendMessageAsync(userId, subject, body, to, attachments);
+                    await _gmailIntegration.SendMessageAsync(userId, subject, body, to, accountIdentifier, attachments);
                     break;
                 case "linkedin":
-                    await _linkedin.SendMessageAsync(userId, to, body);
+                    if (attachments != null && attachments.Any())
+                        throw new ArgumentException("LinkedIn does not support attachments.");
+                    await _linkedinIntegration.SendMessageAsync(userId, to, body, accountIdentifier);
                     break;
                 case "outlook":
-                    await _outlook.SendMessageAsync(userId, subject, body, to, attachments);
+                    await _outlookIntegration.SendMessageAsync(userId, subject, body, to, accountIdentifier, attachments);
                     break;
                 case "whatsapp":
-                    await _whatsapp.SendMessageAsync(userId, body, to);
+                    await _whatsAppIntegration.SendMessageAsync(userId, to, body, accountIdentifier, attachments);
                     break;
                 default:
-                    throw new Exception("Unsupported platform.");
+                    throw new ArgumentException("Unsupported platform.");
             }
         }
 
-        private async Task UpdateLastSyncTime(int userId, string platformType)
+        public async Task<MessageMetadata> GetMessageByExternalId(int userId, string externalMessageId, string accountIdentifier)
         {
-            var syncRecord = await _dbContext.PlatformMessageSyncs
-                .FirstOrDefaultAsync(s => s.UserId == userId && s.PlatformType == platformType);
-
-            if (syncRecord == null)
-            {
-                syncRecord = new PlatformMessageSync
-                {
-                    UserId = userId,
-                    PlatformType = platformType,
-                    LastSyncTime = DateTime.UtcNow
-                };
-                _dbContext.PlatformMessageSyncs.Add(syncRecord);
-            }
-            else
-            {
-                syncRecord.LastSyncTime = DateTime.UtcNow;
-            }
-
-            await _dbContext.SaveChangesAsync();
-        }
-
-        private List<MessageMetadata> MergeMessageLists(
-           List<MessageMetadata> freshMessages,
-           List<MessageMetadata> dbMessages)
-        {
-            // Create a dictionary of existing messages for quick lookup  
-            var mergedDict = dbMessages
-                .Where(m => m.ExternalMessageId != null) // Filter out null ExternalMessageId  
-                .ToDictionary(m => m.ExternalMessageId!); // Use null-forgiving operator  
-                                                          // Create a dictionary of existing messages for quick lookup  
-            //var mergedDict = dbMessages
-            //       .Where(m => m.ExternalMessageId != null) // Filter out null ExternalMessageId  
-            //       .GroupBy(m => m.ExternalMessageId!) // Group by ExternalMessageId to handle duplicates  
-            //       .ToDictionary(g => g.Key, g => g.First()); // Use the first message in case of duplicates  
-
-            // Add or update with fresh messages  
-            foreach (var freshMsg in freshMessages)
-            {
-                if (freshMsg.ExternalMessageId != null && !mergedDict.ContainsKey(freshMsg.ExternalMessageId))
-                {
-                    mergedDict[freshMsg.ExternalMessageId] = freshMsg;
-                }
-                // If needed, update properties from fresh message to db message  
-                // For example, if read status changed  
-            }
-
-            // Convert back to list and sort  
-            return mergedDict.Values
-                .OrderByDescending(m => m.ReceivedAt)
-                .ToList();
-        }
-
-        public async Task<MessageMetadata> GetMessageByExternalId(int userId, string externalMessageId)
-        {
-            // Get message directly from the database - include attachments
             var message = await _dbContext.MessageMetadatas
                 .Include(m => m.Attachments)
-                .FirstOrDefaultAsync(m => m.UserId == userId && m.ExternalMessageId == externalMessageId);
+                .FirstOrDefaultAsync(m => m.UserId == userId && m.ExternalMessageId == externalMessageId && m.AccountIdentifier == accountIdentifier);
 
             if (message == null)
             {
-                throw new KeyNotFoundException($"Message with ID {externalMessageId} not found");
+                throw new KeyNotFoundException($"Message with ID {externalMessageId} not found for account {accountIdentifier}.");
             }
 
-            // Update read status if not already read
-            if (!message.IsRead)
-            {
-                message.IsRead = true;
-                await _dbContext.SaveChangesAsync();
-            }
-
+            message.IsRead = true;
+            await _dbContext.SaveChangesAsync();
             return message;
         }
 
-        public async Task<(byte[] Content, string ContentType, string FileName)> GetAttachmentAsync(int userId, string externalMessageId, string attachmentId)
+        public async Task<(byte[] Content, string ContentType, string FileName)> GetAttachmentAsync(int userId, string messageId, string attachmentId)
         {
-            // Find the message
             var message = await _dbContext.MessageMetadatas
-                .FirstOrDefaultAsync(m => m.UserId == userId && m.ExternalMessageId == externalMessageId);
+                .FirstOrDefaultAsync(m => m.UserId == userId && m.ExternalMessageId == messageId);
 
             if (message == null)
             {
-                throw new KeyNotFoundException($"Message with ID {externalMessageId} not found");
+                throw new KeyNotFoundException($"Message with ID {messageId} not found.");
             }
 
-            // Find the attachment
-            var attachment = await _dbContext.MessageAttachments
-                .FirstOrDefaultAsync(a => a.MessageMetadataId == message.Id && a.AttachmentId == attachmentId);
+            var platform = message.PlatformType;
+            var accountIdentifier = message.AccountIdentifier;
 
-            if (attachment == null)
+            switch (platform.ToLower())
             {
-                throw new KeyNotFoundException($"Attachment with ID {attachmentId} not found");
+                case "gmail":
+                    return await _gmailIntegration.GetAttachmentAsync(userId, messageId, attachmentId, accountIdentifier);
+                case "outlook":
+                    return await _outlookIntegration.GetAttachmentAsync(userId, messageId, attachmentId, accountIdentifier);
+                case "whatsapp":
+                    return await _whatsAppIntegration.GetAttachmentAsync(userId, messageId, attachmentId, accountIdentifier);
+                default:
+                    throw new NotSupportedException($"Attachments not supported for platform {platform}.");
             }
-
-            // If we have the content stored in the database, return it
-            if (attachment.Content != null)
-            {
-                return (attachment.Content, attachment.ContentType, attachment.FileName);
-            }
-
-            // Otherwise, fetch it from the platform
-            return message.PlatformType.ToLower() switch
-            {
-                "gmail" => await _gmail.GetAttachmentAsync(userId, externalMessageId, attachmentId),
-                "outlook" => await _outlook.GetAttachmentAsync(userId, externalMessageId, attachmentId),
-                _ => throw new NotSupportedException($"Attachment download not supported for platform {message.PlatformType}")
-            };
         }
     }
 }

@@ -3,10 +3,10 @@ using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Configuration;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using UMB.Api.Services.Integrations;
 using UMB.Model.Models;
@@ -15,6 +15,7 @@ namespace UMB.Api.Controllers
 {
     [ApiController]
     [Route("api/whatsapp")]
+    [Authorize]
     public class WhatsAppController : ControllerBase
     {
         private readonly IWhatsAppIntegrationService _whatsAppService;
@@ -34,44 +35,43 @@ namespace UMB.Api.Controllers
             _logger = logger;
         }
 
-        // Endpoint to connect WhatsApp with provided credentials
         [HttpPost("connect")]
-        [Authorize]
         public async Task<IActionResult> ConnectWhatsApp([FromBody] WhatsAppCredentialsRequest request)
         {
             try
             {
-                var userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
+                if (string.IsNullOrEmpty(request.PhoneNumber))
+                    return BadRequest("PhoneNumber is required.");
 
-                // First, try to validate the credentials
+                var userId = GetCurrentUserId();
+
+                // Validate credentials
                 var isValid = await _whatsAppService.ValidateCredentialsAsync(
                     request.PhoneNumberId,
                     request.AccessToken,
-                    request.PhoneNumber
-                );
+                    request.PhoneNumber);
 
                 if (!isValid)
-                {
-                    return BadRequest(new
-                    {
-                        success = false,
-                        message = "Invalid WhatsApp Business API credentials. Please check and try again."
-                    });
-                }
+                    return BadRequest(new { success = false, message = "Invalid WhatsApp Business API credentials." });
 
-                // 1. First, store the WhatsApp-specific data in WhatsAppConnections
+                // Store in WhatsAppConnections
                 var existingConnection = await _dbContext.WhatsAppConnections
-                    .FirstOrDefaultAsync(c => c.UserId == userId);
+                    .FirstOrDefaultAsync(c => c.UserId == userId && c.PhoneNumber == request.PhoneNumber);
 
                 if (existingConnection != null)
                 {
                     // Update existing connection
                     existingConnection.PhoneNumberId = request.PhoneNumberId;
                     existingConnection.AccessToken = request.AccessToken;
-                    existingConnection.PhoneNumber = request.PhoneNumber;
                     existingConnection.BusinessName = request.BusinessName;
                     existingConnection.IsConnected = true;
+                    existingConnection.IsActive = true; // Set as active by default
                     existingConnection.UpdatedAt = DateTime.UtcNow;
+
+                    // Deactivate other WhatsApp accounts
+                    await _dbContext.WhatsAppConnections
+                        .Where(c => c.UserId == userId && c.PhoneNumber != request.PhoneNumber)
+                        .ExecuteUpdateAsync(c => c.SetProperty(x => x.IsActive, false));
                 }
                 else
                 {
@@ -84,23 +84,31 @@ namespace UMB.Api.Controllers
                         PhoneNumber = request.PhoneNumber,
                         BusinessName = request.BusinessName,
                         IsConnected = true,
+                        IsActive = true, // Set as active by default
                         CreatedAt = DateTime.UtcNow,
                         UpdatedAt = DateTime.UtcNow
                     };
 
                     _dbContext.WhatsAppConnections.Add(newConnection);
+
+                    // Deactivate other WhatsApp accounts
+                    await _dbContext.WhatsAppConnections
+                        .Where(c => c.UserId == userId)
+                        .ExecuteUpdateAsync(c => c.SetProperty(x => x.IsActive, false));
                 }
 
-                // 2. Now, also store in PlatformAccount for consistency
+                // Store in PlatformAccount for consistency
                 var platformAccount = await _dbContext.PlatformAccounts
-                    .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.PlatformType == "WhatsApp");
+                    .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.AccountIdentifier == request.PhoneNumber && pa.PlatformType == "WhatsApp");
 
                 if (platformAccount != null)
                 {
                     // Update existing entry
                     platformAccount.AccessToken = request.AccessToken;
                     platformAccount.ExternalAccountId = request.PhoneNumberId;
-                    platformAccount.TokenExpiresAt = DateTime.UtcNow.AddDays(60); // Long expiry for API token
+                    platformAccount.AccountIdentifier = request.PhoneNumber;
+                    platformAccount.IsActive = true;
+                    platformAccount.TokenExpiresAt = DateTime.UtcNow.AddDays(60);
                 }
                 else
                 {
@@ -109,21 +117,26 @@ namespace UMB.Api.Controllers
                     {
                         UserId = userId,
                         PlatformType = "WhatsApp",
+                        AccountIdentifier = request.PhoneNumber,
                         AccessToken = request.AccessToken,
-                        RefreshToken = null, // WhatsApp doesn't use refresh tokens
+                        RefreshToken = null,
                         ExternalAccountId = request.PhoneNumberId,
-                        TokenExpiresAt = DateTime.UtcNow.AddDays(60) // Long expiry for API token
+                        IsActive = true,
+                        TokenExpiresAt = DateTime.UtcNow.AddDays(60)
                     };
 
                     _dbContext.PlatformAccounts.Add(platformAccount);
+
+                    // Deactivate other WhatsApp PlatformAccounts
+                    await _dbContext.PlatformAccounts
+                        .Where(pa => pa.UserId == userId && pa.PlatformType == "WhatsApp" && pa.AccountIdentifier != request.PhoneNumber)
+                        .ExecuteUpdateAsync(pa => pa.SetProperty(x => x.IsActive, false));
                 }
 
                 await _dbContext.SaveChangesAsync();
 
-                // If saving was successful, generate a platform ID for the response
-                var platformId = platformAccount?.Id.ToString() ?? Guid.NewGuid().ToString();
+                var platformId = platformAccount.Id.ToString();
 
-                // Return success response with platform info for frontend
                 return Ok(new
                 {
                     success = true,
@@ -132,7 +145,9 @@ namespace UMB.Api.Controllers
                         id = platformId,
                         type = "whatsapp",
                         name = string.IsNullOrEmpty(request.BusinessName) ? "WhatsApp" : request.BusinessName,
+                        accountIdentifier = request.PhoneNumber,
                         isConnected = true,
+                        isActive = true,
                         userId = userId.ToString(),
                         phoneNumber = request.PhoneNumber
                     },
@@ -142,162 +157,180 @@ namespace UMB.Api.Controllers
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error connecting to WhatsApp");
-                return StatusCode(500, new
-                {
-                    success = false,
-                    message = $"Error connecting to WhatsApp: {ex.Message}"
-                });
+                return StatusCode(500, new { success = false, message = $"Error connecting to WhatsApp: {ex.Message}" });
             }
         }
 
-        [HttpDelete("disconnect")]
-        [Authorize]
-        public async Task<IActionResult> DisconnectWhatsApp()
+        [HttpGet("accounts")]
+        public async Task<IActionResult> GetWhatsAppAccounts()
+        {
+            var userId = GetCurrentUserId();
+            var accounts = await _dbContext.WhatsAppConnections
+                .Where(c => c.UserId == userId && c.IsConnected)
+                .ToListAsync();
+
+            var result = accounts.Select(c => new
+            {
+                id = c.Id.ToString(),
+                phoneNumber = c.PhoneNumber,
+                businessName = c.BusinessName,
+                isActive = c.IsActive,
+                isConnected = c.IsConnected,
+                userId = c.UserId.ToString()
+            });
+
+            return Ok(result);
+        }
+
+        [HttpPost("switch")]
+        public async Task<IActionResult> SwitchWhatsAppAccount([FromBody] SwitchAccountRequest request)
+        {
+            if (string.IsNullOrEmpty(request.AccountIdentifier))
+                return BadRequest("PhoneNumber is required.");
+
+            var userId = GetCurrentUserId();
+            var connection = await _dbContext.WhatsAppConnections
+                .FirstOrDefaultAsync(c => c.UserId == userId && c.PhoneNumber == request.AccountIdentifier && c.IsConnected);
+
+            if (connection == null)
+                return NotFound("WhatsApp account not found.");
+
+            // Update WhatsAppConnections
+            await _dbContext.WhatsAppConnections
+                .Where(c => c.UserId == userId)
+                .ExecuteUpdateAsync(c => c.SetProperty(x => x.IsActive, false));
+
+            connection.IsActive = true;
+            connection.UpdatedAt = DateTime.UtcNow;
+
+            // Update PlatformAccounts
+            await _dbContext.PlatformAccounts
+                .Where(pa => pa.UserId == userId && pa.PlatformType == "WhatsApp")
+                .ExecuteUpdateAsync(pa => pa.SetProperty(x => x.IsActive, false));
+
+            var platformAccount = await _dbContext.PlatformAccounts
+                .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.AccountIdentifier == request.AccountIdentifier && pa.PlatformType == "WhatsApp");
+
+            if (platformAccount != null)
+                platformAccount.IsActive = true;
+
+            await _dbContext.SaveChangesAsync();
+
+            return Ok($"Active WhatsApp account switched to {request.AccountIdentifier}.");
+        }
+
+        [HttpDelete("disconnect/{phoneNumber}")]
+        public async Task<IActionResult> DisconnectWhatsApp(string phoneNumber)
         {
             try
             {
-                var userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
+                var userId = GetCurrentUserId();
 
-                // 1. Update WhatsAppConnection
+                // Update WhatsAppConnection
                 var connection = await _dbContext.WhatsAppConnections
-                    .FirstOrDefaultAsync(c => c.UserId == userId);
+                    .FirstOrDefaultAsync(c => c.UserId == userId && c.PhoneNumber == phoneNumber);
 
                 if (connection != null)
                 {
                     connection.IsConnected = false;
+                    connection.IsActive = false;
                     connection.UpdatedAt = DateTime.UtcNow;
                 }
 
-                // 2. Remove or update PlatformAccount entry
+                // Update PlatformAccount
                 var platformAccount = await _dbContext.PlatformAccounts
-                    .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.PlatformType == "WhatsApp");
+                    .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.AccountIdentifier == phoneNumber && pa.PlatformType == "WhatsApp");
 
                 if (platformAccount != null)
                 {
-                    // Option 1: Remove the entry completely
                     _dbContext.PlatformAccounts.Remove(platformAccount);
-
-                    // Option 2: Update the entry to show as disconnected (if your system supports that)
-                    // platformAccount.TokenExpiresAt = DateTime.UtcNow.AddDays(-1); // Set as expired
                 }
 
                 await _dbContext.SaveChangesAsync();
 
-                return Ok(new
-                {
-                    success = true,
-                    message = "Successfully disconnected from WhatsApp Business API."
-                });
+                return Ok(new { success = true, message = $"WhatsApp account {phoneNumber} disconnected." });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error disconnecting from WhatsApp");
-                return StatusCode(500, new
-                {
-                    success = false,
-                    message = $"Error disconnecting from WhatsApp: {ex.Message}"
-                });
+                _logger.LogError(ex, "Error disconnecting WhatsApp");
+                return StatusCode(500, new { success = false, message = $"Error disconnecting WhatsApp: {ex.Message}" });
             }
         }
-        // Endpoint to send a WhatsApp message
+
         [HttpPost("send")]
-        [Authorize]
         public async Task<IActionResult> SendMessage([FromBody] WhatsAppSendRequest request)
         {
             try
             {
-                var userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
-
-                // Get user's WhatsApp connection
+                var userId = GetCurrentUserId();
                 var connection = await _dbContext.WhatsAppConnections
-                    .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected);
+                    .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected && c.IsActive);
 
                 if (connection == null)
-                {
-                    return BadRequest(new
-                    {
-                        success = false,
-                        message = "WhatsApp is not connected. Please connect WhatsApp first."
-                    });
-                }
+                    return BadRequest(new { success = false, message = "No active WhatsApp account connected." });
 
                 string messageId;
 
                 if (!string.IsNullOrEmpty(request.TemplateName))
                 {
-                    // Send template message
                     messageId = await _whatsAppService.SendTemplateMessageAsync(
                         userId,
                         request.To,
                         request.TemplateName,
-                        request.LanguageCode ?? "en_US");
+                        request.LanguageCode ?? "en_US",
+                        connection.PhoneNumber);
                 }
                 else
                 {
-                    // Send text message
-                    messageId = await _whatsAppService.SendMessageAsync(
+                    await _whatsAppService.SendMessageAsync(
                         userId,
+                        request.To,
                         request.Body,
-                        request.To);
+                        connection.PhoneNumber);
+                    messageId = Guid.NewGuid().ToString(); // Placeholder, as SendMessageAsync returns void
                 }
 
-                return Ok(new
-                {
-                    success = true,
-                    messageId,
-                    status = "sent"
-                });
+                return Ok(new { success = true, messageId, status = "sent" });
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error sending WhatsApp message");
-                return StatusCode(500, new
-                {
-                    success = false,
-                    message = $"Error sending WhatsApp message: {ex.Message}"
-                });
+                return StatusCode(500, new { success = false, message = $"Error sending WhatsApp message: {ex.Message}" });
             }
         }
 
-        // Retrieve messages from the database
         [HttpGet("messages")]
-        [Authorize]
         public async Task<IActionResult> GetMessages()
         {
             try
             {
-                var userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
+                var userId = GetCurrentUserId();
+                var activeConnection = await _dbContext.WhatsAppConnections
+                    .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected && c.IsActive);
+
+                if (activeConnection == null)
+                    return BadRequest(new { success = false, message = "No active WhatsApp account connected." });
 
                 var messages = await _dbContext.MessageMetadatas
-                    .Where(m => m.UserId == userId && m.PlatformType == "WhatsApp")
+                    .Where(m => m.UserId == userId && m.PlatformType == "WhatsApp" && m.AccountIdentifier == activeConnection.PhoneNumber)
                     .OrderByDescending(m => m.ReceivedAt)
                     .Take(50)
                     .ToListAsync();
 
-                return Ok(new
-                {
-                    success = true,
-                    messages
-                });
+                return Ok(new { success = true, messages });
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error retrieving WhatsApp messages");
-                return StatusCode(500, new
-                {
-                    success = false,
-                    message = $"Error retrieving WhatsApp messages: {ex.Message}"
-                });
+                return StatusCode(500, new { success = false, message = $"Error retrieving WhatsApp messages: {ex.Message}" });
             }
         }
 
-        // Webhook to receive WhatsApp messages
         [HttpPost("webhook")]
         public async Task<IActionResult> ReceiveWebhook()
         {
             try
             {
-                // Read the request body
                 using var reader = new StreamReader(Request.Body, Encoding.UTF8);
                 var body = await reader.ReadToEndAsync();
 
@@ -305,39 +338,35 @@ namespace UMB.Api.Controllers
 
                 try
                 {
-                    // Parse the webhook payload
                     var options = new JsonSerializerOptions
                     {
                         PropertyNameCaseInsensitive = true,
                         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
                     };
 
-                    // First check if it's a full webhook payload or just a change object
                     var isFullPayload = body.Contains("\"object\"") || body.Contains("\"Object\"");
 
                     if (isFullPayload)
                     {
-                        var fullPayload = JsonSerializer.Deserialize<WhatsAppFullWebhookPayload>(body, options);
-
-                        if (fullPayload?.Entry != null)
-                        {
-                            foreach (var entry in fullPayload.Entry)
-                            {
-                                if (entry.Changes != null)
-                                {
-                                    foreach (var change in entry.Changes)
-                                    {
-                                        await _whatsAppService.ProcessWhatsAppMessageChangeAsync(change);
-                                    }
-                                }
-                            }
-                        }
+                        var fullPayload = JsonSerializer.Deserialize<Services.Integrations.WhatsAppFullWebhookPayload>(body, options);
+                        await _whatsAppService.ProcessIncomingMessageAsync(fullPayload);
                     }
                     else
                     {
-                        // Try to parse as just a change object
-                        var change = JsonSerializer.Deserialize<WhatsAppChange>(body, options);
-                        await _whatsAppService.ProcessWhatsAppMessageChangeAsync(change);
+                        var change = JsonSerializer.Deserialize<Services.Integrations.WhatsAppChange>(body, options);
+                        var fullPayload = new Services.Integrations.WhatsAppFullWebhookPayload
+                        {
+                            Object = "whatsapp_business_account",
+                            Entry = new List<Services.Integrations.WhatsAppEntry>
+                            {
+                                new Services.Integrations.WhatsAppEntry
+                                {
+                                    Id = "0",
+                                    Changes = new List<Services.Integrations.WhatsAppChange> { change }
+                                }
+                            }
+                        };
+                        await _whatsAppService.ProcessIncomingMessageAsync(fullPayload);
                     }
                 }
                 catch (JsonException ex)
@@ -345,23 +374,19 @@ namespace UMB.Api.Controllers
                     _logger.LogError(ex, "Error parsing webhook payload: {Body}", body);
                 }
 
-                // Always return OK for webhook - Meta expects a 200 response
                 return Ok();
             }
             catch (Exception ex)
             {
-                // Log the error but return OK to acknowledge receipt
                 _logger.LogError(ex, "Error processing webhook: {Message}", ex.Message);
                 return Ok();
             }
         }
 
-        // Webhook verification endpoint
         [HttpGet("webhook")]
         public IActionResult VerifyWebhook([FromQuery(Name = "hub.mode")] string hub_mode, [FromQuery(Name = "hub.verify_token")] string hub_verify_token, [FromQuery(Name = "hub.challenge")] string hub_challenge)
         {
             _logger.LogInformation("Verifying webhook with mode: {Mode}, token: {Token}", hub_mode, hub_verify_token);
-
             var verifyToken = _configuration["WhatsAppSettings:WebhookVerifyToken"];
 
             if (hub_mode == "subscribe" && hub_verify_token == verifyToken)
@@ -374,28 +399,32 @@ namespace UMB.Api.Controllers
             return BadRequest();
         }
 
-        // Mark a message as read
         [HttpPost("messages/{messageId}/read")]
-        [Authorize]
         public async Task<IActionResult> MarkAsRead(string messageId)
         {
             try
             {
-                var userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
+                var userId = GetCurrentUserId();
+                var activeConnection = await _dbContext.WhatsAppConnections
+                    .FirstOrDefaultAsync(c => c.UserId == userId && c.IsConnected && c.IsActive);
 
-                await _whatsAppService.MarkMessageAsReadAsync(userId, messageId);
+                if (activeConnection == null)
+                    return BadRequest(new { success = false, message = "No active WhatsApp account connected." });
 
+                await _whatsAppService.MarkMessageAsReadAsync(userId, messageId, activeConnection.PhoneNumber);
                 return Ok(new { success = true });
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error marking message as read: {MessageId}", messageId);
-                return StatusCode(500, new
-                {
-                    success = false,
-                    message = $"Error marking message as read: {ex.Message}"
-                });
+                return StatusCode(500, new { success = false, message = $"Error marking message as read: {ex.Message}" });
             }
+        }
+
+        private int GetCurrentUserId()
+        {
+            var userIdClaim = User.Claims.FirstOrDefault(c => c.Type == "userId");
+            return userIdClaim != null ? int.Parse(userIdClaim.Value) : 0;
         }
     }
 
@@ -411,7 +440,12 @@ namespace UMB.Api.Controllers
     {
         public string To { get; set; }
         public string Body { get; set; }
-        public string? TemplateName { get; set; }
-        public string? LanguageCode { get; set; }
+        public string TemplateName { get; set; }
+        public string LanguageCode { get; set; }
+    }
+
+    public class SwitchAccountRequest
+    {
+        public string AccountIdentifier { get; set; }
     }
 }

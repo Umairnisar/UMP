@@ -6,6 +6,8 @@
         public int UserId { get; set; }
         public string PlatformType { get; set; }  // e.g. "Gmail", "LinkedIn", "Outlook"
         public string? ExternalMessageId { get; set; }
+        public string AccountIdentifier { get; set; } // New: Email for Gmail, PhoneNumber for WhatsApp
+
         public string? Subject { get; set; }
         public string? Snippet { get; set; }
         public DateTime ReceivedAt { get; set; }
@@ -23,3 +25,4 @@
         public ICollection<MessageAttachment> Attachments { get; set; } = new List<MessageAttachment>();
     }
 }
+

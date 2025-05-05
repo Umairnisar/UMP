@@ -1,9 +1,14 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
-using System.Text.Json;
-using System.Text;
 using System.Net.Http.Headers;
-using System.Text.Json.Serialization;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
 using UMB.Model.Models;
 
 namespace UMB.Api.Services.Integrations
@@ -12,90 +17,45 @@ namespace UMB.Api.Services.Integrations
     {
         private readonly IConfiguration _config;
         private readonly AppDbContext _dbContext;
-        private readonly ILogger<LinkedInIntegrationService> _logger;
         private readonly HttpClient _httpClient;
+        private readonly ILogger<LinkedInIntegrationService> _logger;
 
         public LinkedInIntegrationService(
             IConfiguration config,
             AppDbContext dbContext,
-            ILogger<LinkedInIntegrationService> logger,
-            IHttpClientFactory httpClientFactory)
+            IHttpClientFactory httpClientFactory,
+            ILogger<LinkedInIntegrationService> logger)
         {
             _config = config;
             _dbContext = dbContext;
+            _httpClient = httpClientFactory.CreateClient();
             _logger = logger;
-            _httpClient = httpClientFactory.CreateClient("LinkedIn");
         }
 
-        //public string GetAuthorizationUrl(int userId)
-        //{
-        //    try
-        //    {
-        //        var clientId = _config["LinkedInSettings:ClientId"];
-        //        if (string.IsNullOrEmpty(clientId))
-        //        {
-        //            _logger.LogError("LinkedIn ClientId is missing in configuration");
-        //            throw new InvalidOperationException("LinkedIn client ID is not configured");
-        //        }
-
-        //        var redirectUri = _config["LinkedInSettings:RedirectUri"];
-        //        // URL encode the redirect URI to ensure it's properly formatted
-        //        var encodedRedirectUri = Uri.EscapeDataString(redirectUri);
-
-        //        // LinkedIn scopes - Note that w_messages requires LinkedIn Marketing Developer Platform approval
-        //        var scopes = "r_liteprofile r_emailaddress w_member_social";
-
-        //        var state = Uri.EscapeDataString(userId.ToString());
-
-        //        var url = $"https://www.linkedin.com/oauth/v2/authorization" +
-        //                  $"?response_type=code" +
-        //                  $"&client_id={clientId}" +
-        //                  $"&redirect_uri={encodedRedirectUri}" +
-        //                  $"&scope={scopes}" +
-        //                  $"&state={state}";
-
-        //        _logger.LogInformation("Generated LinkedIn authorization URL for user {UserId}", userId);
-        //        return url;
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        _logger.LogError(ex, "Error generating LinkedIn authorization URL for user {UserId}", userId);
-        //        throw;
-        //    }
-        //}
-
-        public string GetAuthorizationUrl(int userId)
+        public string GetAuthorizationUrl(int userId, string accountIdentifier)
         {
             var clientId = _config["LinkedInSettings:ClientId"];
             var redirectUri = _config["LinkedInSettings:RedirectUri"];
-            var scopes = "r_liteprofile%20r_emailaddress%20w_member_social%20w_messages";
-            // Check which scopes are needed; LinkedIn often requires special permission for messaging
+            var scopes = "r_emailaddress r_inmail w_member_social r_basicprofile r_messages";
 
-            var url = $"https://www.linkedin.com/oauth/v2/authorization" +
-                      $"?response_type=code" +
-                      $"&client_id={clientId}" +
-                      $"&redirect_uri={redirectUri}" +
-                      $"&scope={scopes}" +
-                      $"&state={userId}";
+            var authUrl = $"https://www.linkedin.com/oauth/v2/authorization" +
+                          $"?response_type=code" +
+                          $"&client_id={clientId}" +
+                          $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
+                          $"&scope={Uri.EscapeDataString(scopes)}" +
+                          $"&state={userId}|{accountIdentifier}"; // Include accountIdentifier in state
 
-            return url;
+            return authUrl;
         }
 
-        public async Task<bool> ExchangeCodeForTokenAsync(int userId, string code)
+        public async Task ExchangeCodeForTokenAsync(int userId, string code, string accountIdentifier)
         {
             try
             {
-                if (string.IsNullOrEmpty(code))
-                {
-                    _logger.LogError("Cannot exchange empty authorization code for user {UserId}", userId);
-                    throw new ArgumentException("Authorization code cannot be empty", nameof(code));
-                }
-
                 var clientId = _config["LinkedInSettings:ClientId"];
                 var clientSecret = _config["LinkedInSettings:ClientSecret"];
                 var redirectUri = _config["LinkedInSettings:RedirectUri"];
-
-                var tokenRequestUrl = "https://www.linkedin.com/oauth/v2/accessToken";
+                var tokenUrl = "https://www.linkedin.com/oauth/v2/accessToken";
 
                 var requestBody = new FormUrlEncodedContent(new Dictionary<string, string>
                 {
@@ -106,314 +66,210 @@ namespace UMB.Api.Services.Integrations
                     { "client_secret", clientSecret }
                 });
 
-                var response = await _httpClient.PostAsync(tokenRequestUrl, requestBody);
+                var response = await _httpClient.PostAsync(tokenUrl, requestBody);
+                response.EnsureSuccessStatusCode();
+                var json = await response.Content.ReadAsStringAsync();
+                var tokenData = JsonSerializer.Deserialize<LinkedInTokenResponse>(json);
 
-                // Read the response content for error details if needed
-                var responseContent = await response.Content.ReadAsStringAsync();
+                var platformAccount = await _dbContext.PlatformAccounts
+                    .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.PlatformType == "LinkedIn" && pa.AccountIdentifier == accountIdentifier);
 
-                if (!response.IsSuccessStatusCode)
+                if (platformAccount == null)
                 {
-                    _logger.LogError("LinkedIn token exchange failed with status {StatusCode}: {ResponseContent}",
-                        response.StatusCode, responseContent);
-                    throw new HttpRequestException($"Failed to exchange code for token. Status: {response.StatusCode}, Response: {responseContent}");
-                }
-
-                var tokenOptions = new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                };
-
-                var tokenData = JsonSerializer.Deserialize<LinkedInTokenResponse>(responseContent, tokenOptions);
-
-                if (tokenData == null || string.IsNullOrEmpty(tokenData.AccessToken))
-                {
-                    _logger.LogError("LinkedIn returned invalid token data for user {UserId}", userId);
-                    throw new InvalidOperationException("Invalid token data received from LinkedIn");
-                }
-
-                var account = await _dbContext.PlatformAccounts
-                    .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.PlatformType == "LinkedIn");
-
-                if (account == null)
-                {
-                    account = new PlatformAccount
+                    platformAccount = new PlatformAccount
                     {
                         UserId = userId,
-                        PlatformType = "LinkedIn"
+                        PlatformType = "LinkedIn",
+                        AccountIdentifier = accountIdentifier, // e.g., LinkedIn profile ID or email
+                        CreatedAt = DateTime.UtcNow
                     };
-                    _dbContext.PlatformAccounts.Add(account);
+                    _dbContext.PlatformAccounts.Add(platformAccount);
                 }
 
-                account.AccessToken = tokenData.AccessToken;
-                // LinkedIn typically doesn't provide refresh tokens for standard applications
-                account.RefreshToken = tokenData.RefreshToken; // This might be null
-                account.TokenExpiresAt = DateTime.UtcNow.AddSeconds(tokenData.ExpiresIn);
-                account.ExternalAccountId = null; // LinkedIn doesn't provide this in the token response
+                platformAccount.AccessToken = tokenData.access_token;
+                platformAccount.TokenExpiresAt = DateTime.UtcNow.AddSeconds(tokenData.expires_in);
+                platformAccount.UpdatedAt = DateTime.UtcNow;
 
                 await _dbContext.SaveChangesAsync();
-                _logger.LogInformation("Successfully exchanged code for LinkedIn token for user {UserId}", userId);
-
-                return true;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error exchanging code for LinkedIn token for user {UserId}", userId);
+                _logger.LogError(ex, "Error exchanging code for LinkedIn token for user {UserId}, account {AccountIdentifier}", userId, accountIdentifier);
                 throw;
             }
         }
 
-        public async Task<List<MessageMetadata>> FetchMessagesAsync(int userId)
+        public async Task<List<MessageMetadata>> FetchMessagesAsync(int userId, string accountIdentifier = null)
         {
             try
             {
-                var account = await _dbContext.PlatformAccounts
-                    .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.PlatformType == "LinkedIn");
-
-                if (account == null)
+                var query = _dbContext.PlatformAccounts
+                    .Where(pa => pa.UserId == userId && pa.PlatformType == "LinkedIn");
+                if (!string.IsNullOrEmpty(accountIdentifier))
                 {
-                    _logger.LogWarning("No LinkedIn account found for user {UserId}", userId);
+                    query = query.Where(pa => pa.AccountIdentifier == accountIdentifier);
+                }
+
+                var accounts = await query.ToListAsync();
+                if (!accounts.Any())
+                {
                     return new List<MessageMetadata>();
                 }
 
-                await EnsureValidAccessTokenAsync(account);
-
-                // LinkedIn's Messaging API requires Marketing Developer Platform approval
-                // This is a simplified example using the Conversations API v2
-                var url = "https://api.linkedin.com/v2/messaging/conversations";
-
-                _httpClient.DefaultRequestHeaders.Authorization =
-                    new AuthenticationHeaderValue("Bearer", account.AccessToken);
-
-                var response = await _httpClient.GetAsync(url);
-                var responseContent = await response.Content.ReadAsStringAsync();
-
-                if (!response.IsSuccessStatusCode)
+                var allMessages = new List<MessageMetadata>();
+                foreach (var account in accounts)
                 {
-                    _logger.LogError("LinkedIn API call failed with status {StatusCode}: {ResponseContent}",
-                        response.StatusCode, responseContent);
+                    await EnsureValidAccessTokenAsync(account);
+                    _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
 
-                    // If unauthorized, we should invalidate the token
-                    if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                    var response = await _httpClient.GetAsync("https://api.linkedin.com/v2/messages?q=conversations&fields=id,participants,subject,text,createdAt");
+                    if (!response.IsSuccessStatusCode)
                     {
-                        account.TokenExpiresAt = DateTime.UtcNow.AddMinutes(-1); // Mark as expired
+                        _logger.LogWarning("Failed to fetch LinkedIn messages for account {AccountIdentifier}: {StatusCode}", account.AccountIdentifier, response.StatusCode);
+                        continue;
+                    }
+
+                    var json = await response.Content.ReadAsStringAsync();
+                    var messages = JsonSerializer.Deserialize<LinkedInMessagesResponse>(json);
+
+                    var messageMetadataList = new List<MessageMetadata>();
+                    foreach (var msg in messages?.elements ?? new List<LinkedInMessage>())
+                    {
+                        var participants = msg.participants?.Select(p => p.entityUrn).ToList() ?? new List<string>();
+                        var sender = participants.FirstOrDefault(p => !p.Contains("urn:li:person:" + account.ExternalAccountId)) ?? "Unknown";
+
+                        var messageMetadata = new MessageMetadata
+                        {
+                            UserId = userId,
+                            PlatformType = "LinkedIn",
+                            ExternalMessageId = msg.id,
+                            AccountIdentifier = account.AccountIdentifier,
+                            Subject = msg.subject ?? "LinkedIn Message",
+                            Snippet = msg.text?.Length > 100 ? msg.text.Substring(0, 97) + "..." : msg.text,
+                            Body = msg.text,
+                            From = sender,
+                            ReceivedAt = DateTimeOffset.FromUnixTimeMilliseconds(msg.createdAt).UtcDateTime,
+                            IsRead = false
+                        };
+
+                        messageMetadataList.Add(messageMetadata);
+                    }
+
+                    var existingIds = await _dbContext.MessageMetadatas
+                        .Where(m => m.UserId == userId && m.PlatformType == "LinkedIn" && m.AccountIdentifier == account.AccountIdentifier)
+                        .Select(m => m.ExternalMessageId)
+                        .ToListAsync();
+
+                    var newMessages = messageMetadataList.Where(m => !existingIds.Contains(m.ExternalMessageId)).ToList();
+                    if (newMessages.Any())
+                    {
+                        await _dbContext.MessageMetadatas.AddRangeAsync(newMessages);
                         await _dbContext.SaveChangesAsync();
                     }
 
-                    return new List<MessageMetadata>();
+                    allMessages.AddRange(messageMetadataList);
                 }
 
-                var messages = new List<MessageMetadata>();
-
-                // Parse the response - actual structure will depend on LinkedIn's API response
-                try
-                {
-                    // This is a simplified example - adjust based on actual LinkedIn API response
-                    var conversationsResponse = JsonSerializer.Deserialize<LinkedInConversationsResponse>(responseContent);
-
-                    if (conversationsResponse?.Elements != null)
-                    {
-                        foreach (var conversation in conversationsResponse.Elements)
-                        {
-                            // Get the most recent message in each conversation
-                            if (conversation.Events?.Count > 0)
-                            {
-                                var latestEvent = conversation.Events[0]; // Assuming sorted by recency
-
-                                var metadata = new MessageMetadata
-                                {
-                                    PlatformType = "LinkedIn",
-                                    ExternalMessageId = latestEvent.MessageId,
-                                    Subject = $"Conversation with {conversation.ParticipantsNames?.FirstOrDefault() ?? "Unknown"}",
-                                    Snippet = (string)(latestEvent.Text?.Take(100) ?? "No content"),
-                                    ReceivedAt = latestEvent.CreatedAt
-                                };
-
-                                messages.Add(metadata);
-                            }
-                        }
-                    }
-                }
-                catch (JsonException ex)
-                {
-                    _logger.LogError(ex, "Error parsing LinkedIn messages response: {ResponseContent}", responseContent);
-                }
-
-                return messages;
+                return allMessages.OrderByDescending(m => m.ReceivedAt).ToList();
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error fetching LinkedIn messages for user {UserId}", userId);
+                _logger.LogError(ex, "Error fetching LinkedIn messages for user {UserId}, account {AccountIdentifier}", userId, accountIdentifier);
                 return new List<MessageMetadata>();
             }
         }
 
-        public async Task SendMessageAsync(int userId, string recipientId, string messageText)
+        public async Task<string> SendMessageAsync(int userId, string recipientUrn, string message, string accountIdentifier)
         {
-            try
+            var account = await _dbContext.PlatformAccounts
+                .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.PlatformType == "LinkedIn" && pa.AccountIdentifier == accountIdentifier);
+
+            if (account == null)
+                throw new Exception($"No LinkedIn account connected for {accountIdentifier}.");
+
+            await EnsureValidAccessTokenAsync(account);
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+
+            var payload = new
             {
-                var account = await _dbContext.PlatformAccounts
-                    .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.PlatformType == "LinkedIn");
+                recipients = new[] { new { personUrn = recipientUrn } },
+                subject = "Message from UMB",
+                text = message
+            };
 
-                if (account == null)
-                {
-                    _logger.LogError("No LinkedIn account found for user {UserId}", userId);
-                    throw new InvalidOperationException("No LinkedIn account connected.");
-                }
+            var content = new StringContent(
+                JsonSerializer.Serialize(payload),
+                Encoding.UTF8,
+                "application/json");
 
-                await EnsureValidAccessTokenAsync(account);
-
-                _httpClient.DefaultRequestHeaders.Authorization =
-                    new AuthenticationHeaderValue("Bearer", account.AccessToken);
-
-                // LinkedIn's Messaging API v2
-                var url = "https://api.linkedin.com/v2/messaging/conversations";
-
-                // This is a simplified structure - the actual API might require a different format
-                var payload = new
-                {
-                    recipients = new[]
-                    {
-                        new { person = new { id = recipientId } }
-                    },
-                    messageContent = new
-                    {
-                        text = messageText
-                    }
-                };
-
-                var content = new StringContent(
-                    JsonSerializer.Serialize(payload),
-                    Encoding.UTF8,
-                    "application/json");
-
-                var response = await _httpClient.PostAsync(url, content);
-                var responseContent = await response.Content.ReadAsStringAsync();
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    _logger.LogError("Failed to send LinkedIn message: {StatusCode} - {Response}",
-                        response.StatusCode, responseContent);
-
-                    throw new HttpRequestException($"Failed to send LinkedIn message. Status: {response.StatusCode}, Response: {responseContent}");
-                }
-
-                _logger.LogInformation("Successfully sent LinkedIn message to recipient {RecipientId}", recipientId);
-            }
-            catch (Exception ex)
+            var response = await _httpClient.PostAsync("https://api.linkedin.com/v2/messages", content);
+            if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError(ex, "Error sending LinkedIn message for user {UserId} to recipient {RecipientId}",
-                    userId, recipientId);
-                throw;
+                var errorContent = await response.Content.ReadAsStringAsync();
+                throw new Exception($"Failed to send LinkedIn message: {errorContent}");
             }
+
+            var responseContent = await response.Content.ReadAsStringAsync();
+            var messageId = JsonSerializer.Deserialize<LinkedInMessageResponse>(responseContent)?.id ?? Guid.NewGuid().ToString();
+
+            var messageMetadata = new MessageMetadata
+            {
+                UserId = userId,
+                PlatformType = "LinkedIn",
+                ExternalMessageId = messageId,
+                AccountIdentifier = account.AccountIdentifier,
+                Subject = "LinkedIn Message",
+                Snippet = message.Length > 100 ? message.Substring(0, 97) + "..." : message,
+                Body = message,
+                From = "You",
+                ReceivedAt = DateTime.UtcNow,
+                IsRead = true
+            };
+
+            _dbContext.MessageMetadatas.Add(messageMetadata);
+            await _dbContext.SaveChangesAsync();
+            return messageId;
         }
 
-        public async Task EnsureValidAccessTokenAsync(PlatformAccount account)
+        private async Task EnsureValidAccessTokenAsync(PlatformAccount account)
         {
-            try
-            {
-                // Check if token is still valid
-                if (account.TokenExpiresAt.HasValue && account.TokenExpiresAt > DateTime.UtcNow)
-                    return; // Token is still valid
+            if (account.TokenExpiresAt > DateTime.UtcNow.AddMinutes(-5))
+                return;
 
-                _logger.LogInformation("LinkedIn token expired for account {AccountId}", account.Id);
-
-                // LinkedIn typically doesn't provide refresh tokens for standard applications
-                // If we have a refresh token, try to use it
-                if (!string.IsNullOrEmpty(account.RefreshToken))
-                {
-                    try
-                    {
-                        var clientId = _config["LinkedInSettings:ClientId"];
-                        var clientSecret = _config["LinkedInSettings:ClientSecret"];
-
-                        var tokenRequestUrl = "https://www.linkedin.com/oauth/v2/accessToken";
-
-                        var requestBody = new FormUrlEncodedContent(new Dictionary<string, string>
-                        {
-                            { "grant_type", "refresh_token" },
-                            { "refresh_token", account.RefreshToken },
-                            { "client_id", clientId },
-                            { "client_secret", clientSecret }
-                        });
-
-                        var response = await _httpClient.PostAsync(tokenRequestUrl, requestBody);
-
-                        if (response.IsSuccessStatusCode)
-                        {
-                            var json = await response.Content.ReadAsStringAsync();
-                            var tokenData = JsonSerializer.Deserialize<LinkedInTokenResponse>(json);
-
-                            account.AccessToken = tokenData.AccessToken;
-                            // Update refresh token if a new one is provided
-                            if (!string.IsNullOrEmpty(tokenData.RefreshToken))
-                            {
-                                account.RefreshToken = tokenData.RefreshToken;
-                            }
-
-                            account.TokenExpiresAt = DateTime.UtcNow.AddSeconds(tokenData.ExpiresIn);
-                            await _dbContext.SaveChangesAsync();
-
-                            _logger.LogInformation("Successfully refreshed LinkedIn token for account {AccountId}", account.Id);
-                            return;
-                        }
-                        else
-                        {
-                            var responseContent = await response.Content.ReadAsStringAsync();
-                            _logger.LogWarning("Failed to refresh LinkedIn token: {StatusCode} - {Response}",
-                                response.StatusCode, responseContent);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Error refreshing LinkedIn token for account {AccountId}", account.Id);
-                    }
-                }
-
-                // If we reach here, we couldn't refresh the token
-                throw new InvalidOperationException("LinkedIn token expired and cannot be refreshed. User must re-authorize.");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error ensuring valid LinkedIn access token for account {AccountId}", account.Id);
-                throw;
-            }
-        }
-
-        Task ILinkedInIntegrationService.ExchangeCodeForTokenAsync(int userId, string code)
-        {
-            throw new NotImplementedException();
+            // LinkedIn does not support refresh tokens, so re-authentication is required
+            _logger.LogWarning("LinkedIn access token expired for account {AccountIdentifier}. Re-authentication required.", account.AccountIdentifier);
+            throw new Exception("LinkedIn access token expired. Please re-authenticate.");
         }
     }
 
-    // Response models for LinkedIn API
+    // Helper classes for JSON deserialization
     public class LinkedInTokenResponse
     {
-        [JsonPropertyName("access_token")]
-        public string AccessToken { get; set; }
-
-        [JsonPropertyName("expires_in")]
-        public int ExpiresIn { get; set; }
-
-        [JsonPropertyName("refresh_token")]
-        public string RefreshToken { get; set; }
+        public string access_token { get; set; }
+        public int expires_in { get; set; }
     }
 
-    public class LinkedInConversationsResponse
+    public class LinkedInMessagesResponse
     {
-        public List<LinkedInConversation> Elements { get; set; }
+        public List<LinkedInMessage> elements { get; set; }
     }
 
-    public class LinkedInConversation
+    public class LinkedInMessage
     {
-        public string EntityUrn { get; set; }
-        public List<string> ParticipantsNames { get; set; }
-        public List<LinkedInMessageEvent> Events { get; set; }
+        public string id { get; set; }
+        public List<LinkedInParticipant> participants { get; set; }
+        public string subject { get; set; }
+        public string text { get; set; }
+        public long createdAt { get; set; }
     }
 
-    public class LinkedInMessageEvent
+    public class LinkedInParticipant
     {
-        public string MessageId { get; set; }
-        public string Text { get; set; }
-        public DateTime CreatedAt { get; set; }
+        public string entityUrn { get; set; }
+    }
+
+    public class LinkedInMessageResponse
+    {
+        public string id { get; set; }
     }
 }
