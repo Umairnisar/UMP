@@ -128,7 +128,8 @@ namespace UMB.Api.Controllers
         public string Subject { get; set; }
         public string Body { get; set; }
         public string To { get; set; }
-        public List<IFormFile> Attachments { get; set; }
+        //public List<IFormFile> Attachments { get; set; }
+        public List<IFormFile>? Attachments { get; set; } = new List<IFormFile>();
     }
 
     public class MarkMessageReadRequest
