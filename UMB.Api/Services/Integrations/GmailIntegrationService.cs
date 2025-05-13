@@ -75,7 +75,9 @@ namespace UMB.Api.Services.Integrations
                     UserId = userId,
                     PlatformType = "Gmail",
                     AccountIdentifier = email,
-                    CreatedAt = DateTime.UtcNow
+                    CreatedAt = DateTime.UtcNow,
+                    ExternalAccountId="1",
+                    IsActive=true
                 };
                 _dbContext.PlatformAccounts.Add(platformAccount);
             }
@@ -222,9 +224,12 @@ namespace UMB.Api.Services.Integrations
                 Snippet = body.Length > 100 ? body.Substring(0, 97) + "..." : body,
                 Body = body,
                 HtmlBody = body,
-                From = "You",
+                From = account.AccountIdentifier,
                 ReceivedAt = DateTime.UtcNow,
                 IsRead = true,
+                To=toEmail,
+
+
                 HasAttachments = attachments != null && attachments.Any()
             };
 

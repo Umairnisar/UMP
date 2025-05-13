@@ -32,42 +32,65 @@ namespace UMB.Api.Services.Integrations
             _logger = logger;
         }
 
+        //public string GetAuthorizationUrl(int userId, string accountIdentifier)
+        //{
+        //    var clientId = _config["LinkedInSettings:ClientId"];
+        //    var redirectUri = _config["LinkedInSettings:RedirectUri"];
+        //    var scopes = "r_emailaddress r_inmail w_member_social r_basicprofile r_messages";
+
+        //    var authUrl = $"https://www.linkedin.com/oauth/v2/authorization" +
+        //                  $"?response_type=code" +
+        //                  $"&client_id={clientId}" +
+        //                  $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
+        //                  $"&scope={Uri.EscapeDataString(scopes)}" +
+        //                  $"&state={userId}|{accountIdentifier}"; // Include accountIdentifier in state
+
+        //    return authUrl;
+        //}
         public string GetAuthorizationUrl(int userId, string accountIdentifier)
         {
             var clientId = _config["LinkedInSettings:ClientId"];
             var redirectUri = _config["LinkedInSettings:RedirectUri"];
-            var scopes = "r_emailaddress r_inmail w_member_social r_basicprofile r_messages";
+            var state = $"{userId}|{accountIdentifier}"; // Combine userId and accountIdentifier
+            var scopes = "openid profile email";
 
-            var authUrl = $"https://www.linkedin.com/oauth/v2/authorization" +
-                          $"?response_type=code" +
-                          $"&client_id={clientId}" +
-                          $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
-                          $"&scope={Uri.EscapeDataString(scopes)}" +
-                          $"&state={userId}|{accountIdentifier}"; // Include accountIdentifier in state
-
-            return authUrl;
+            return $"https://www.linkedin.com/oauth/v2/authorization" +
+                   $"?response_type=code" +
+                   $"&client_id={clientId}" +
+                   $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
+                   $"&state={Uri.EscapeDataString(state)}" +
+                   $"&scope={Uri.EscapeDataString(scopes)}";
         }
-
         public async Task ExchangeCodeForTokenAsync(int userId, string code, string accountIdentifier)
         {
             try
             {
-                var clientId = _config["LinkedInSettings:ClientId"];
-                var clientSecret = _config["LinkedInSettings:ClientSecret"];
-                var redirectUri = _config["LinkedInSettings:RedirectUri"];
+                var clientId = _config["LinkedInSettings:ClientId"]
+                    ?? throw new InvalidOperationException("LinkedInSettings:ClientId is not configured.");
+                var clientSecret = _config["LinkedInSettings:ClientSecret"]
+                    ?? throw new InvalidOperationException("LinkedInSettings:ClientSecret is not configured.");
+                var redirectUri = _config["LinkedInSettings:RedirectUri"]
+                    ?? throw new InvalidOperationException("LinkedInSettings:RedirectUri is not configured.");
                 var tokenUrl = "https://www.linkedin.com/oauth/v2/accessToken";
 
                 var requestBody = new FormUrlEncodedContent(new Dictionary<string, string>
-                {
-                    { "grant_type", "authorization_code" },
-                    { "code", code },
-                    { "redirect_uri", redirectUri },
-                    { "client_id", clientId },
-                    { "client_secret", clientSecret }
-                });
+        {
+            { "grant_type", "authorization_code" },
+            { "code", code },
+            { "redirect_uri", redirectUri },
+            { "client_id", clientId },
+            { "client_secret", clientSecret }
+        });
 
                 var response = await _httpClient.PostAsync(tokenUrl, requestBody);
-                response.EnsureSuccessStatusCode();
+                if (!response.IsSuccessStatusCode)
+                {
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    _logger.LogError("LinkedIn token request failed with status {StatusCode}. Response: {ErrorContent}",
+                        response.StatusCode, errorContent);
+                    throw new HttpRequestException($"Token request failed: {response.StatusCode}. Details: {errorContent}");
+                }
+
                 var json = await response.Content.ReadAsStringAsync();
                 var tokenData = JsonSerializer.Deserialize<LinkedInTokenResponse>(json);
 
@@ -80,8 +103,10 @@ namespace UMB.Api.Services.Integrations
                     {
                         UserId = userId,
                         PlatformType = "LinkedIn",
-                        AccountIdentifier = accountIdentifier, // e.g., LinkedIn profile ID or email
-                        CreatedAt = DateTime.UtcNow
+                        AccountIdentifier = accountIdentifier,
+                        CreatedAt = DateTime.UtcNow,
+                        ExternalAccountId="LinkedIn",
+                        RefreshToken=tokenData.access_token
                     };
                     _dbContext.PlatformAccounts.Add(platformAccount);
                 }
@@ -98,6 +123,57 @@ namespace UMB.Api.Services.Integrations
                 throw;
             }
         }
+
+        //public async Task ExchangeCodeForTokenAsync(int userId, string code, string accountIdentifier)
+        //{
+        //    try
+        //    {
+        //        var clientId = _config["LinkedInSettings:ClientId"];
+        //        var clientSecret = _config["LinkedInSettings:ClientSecret"];
+        //        var redirectUri = _config["LinkedInSettings:RedirectUri"];
+        //        var tokenUrl = "https://www.linkedin.com/oauth/v2/accessToken";
+
+        //        var requestBody = new FormUrlEncodedContent(new Dictionary<string, string>
+        //        {
+        //            { "grant_type", "authorization_code" },
+        //            { "code", code },
+        //            { "redirect_uri", redirectUri },
+        //            { "client_id", clientId },
+        //            { "client_secret", clientSecret }
+        //        });
+
+        //        var response = await _httpClient.PostAsync(tokenUrl, requestBody);
+        //        response.EnsureSuccessStatusCode();
+        //        var json = await response.Content.ReadAsStringAsync();
+        //        var tokenData = JsonSerializer.Deserialize<LinkedInTokenResponse>(json);
+
+        //        var platformAccount = await _dbContext.PlatformAccounts
+        //            .FirstOrDefaultAsync(pa => pa.UserId == userId && pa.PlatformType == "LinkedIn" && pa.AccountIdentifier == accountIdentifier);
+
+        //        if (platformAccount == null)
+        //        {
+        //            platformAccount = new PlatformAccount
+        //            {
+        //                UserId = userId,
+        //                PlatformType = "LinkedIn",
+        //                AccountIdentifier = accountIdentifier, // e.g., LinkedIn profile ID or email
+        //                CreatedAt = DateTime.UtcNow
+        //            };
+        //            _dbContext.PlatformAccounts.Add(platformAccount);
+        //        }
+
+        //        platformAccount.AccessToken = tokenData.access_token;
+        //        platformAccount.TokenExpiresAt = DateTime.UtcNow.AddSeconds(tokenData.expires_in);
+        //        platformAccount.UpdatedAt = DateTime.UtcNow;
+
+        //        await _dbContext.SaveChangesAsync();
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        _logger.LogError(ex, "Error exchanging code for LinkedIn token for user {UserId}, account {AccountIdentifier}", userId, accountIdentifier);
+        //        throw;
+        //    }
+        //}
 
         public async Task<List<MessageMetadata>> FetchMessagesAsync(int userId, string accountIdentifier = null)
         {
