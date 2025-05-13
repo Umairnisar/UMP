@@ -47,7 +47,7 @@ builder.Services.AddScoped<IGmailIntegrationService, GmailIntegrationService>();
 builder.Services.AddScoped<IMessageService, MessageService>();
 builder.Services.AddScoped<IOutlookIntegrationService, OutlookIntegrationService>();
 builder.Services.AddScoped<ILinkedInIntegrationService, LinkedInIntegrationService>();
-builder.Services.AddScoped<BaseIntegrationService>();
+builder.Services.AddScoped<IBaseIntegrationService, BaseIntegrationService>();
 builder.Services.AddHttpClient<IOpenAIService, OpenAIService>();
 builder.Services.AddScoped<ITextProcessingService, TextProcessingService>();
 builder.Services.AddScoped<IWhatsAppIntegrationService, WhatsAppIntegrationService>();
