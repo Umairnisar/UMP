@@ -144,7 +144,10 @@ namespace UMB.Api.Services.Integrations
                                 ? fullMessage.Payload?.Headers?.FirstOrDefault(h => h.Name == "From")?.Value?.Split('<')[1].Trim('>', ' ')
                                 : fullMessage.Payload?.Headers?.FirstOrDefault(h => h.Name == "From")?.Value,
                             ReceivedAt = DateTimeOffset.FromUnixTimeMilliseconds(fullMessage.InternalDate.Value).UtcDateTime,
-                            HasAttachments = hasAttachments
+                            HasAttachments = hasAttachments,
+                            IsRead = fullMessage.LabelIds?.Contains("UNREAD") == false,
+                            IsNew = true,
+                            IsAutoReplied = false
                         };
 
                         if (hasAttachments)
@@ -228,7 +231,8 @@ namespace UMB.Api.Services.Integrations
                 ReceivedAt = DateTime.UtcNow,
                 IsRead = true,
                 To=toEmail,
-
+                IsNew = false,
+                IsAutoReplied = false,
 
                 HasAttachments = attachments != null && attachments.Any()
             };

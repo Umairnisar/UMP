@@ -51,6 +51,8 @@ builder.Services.AddScoped<IBaseIntegrationService, BaseIntegrationService>();
 builder.Services.AddHttpClient<IOpenAIService, OpenAIService>();
 builder.Services.AddScoped<ITextProcessingService, TextProcessingService>();
 builder.Services.AddScoped<IWhatsAppIntegrationService, WhatsAppIntegrationService>();
+builder.Services.AddHostedService<AutoReplyService>();
+
 
 builder.Services.AddHttpClient("WhatsAppClient", client =>
 {

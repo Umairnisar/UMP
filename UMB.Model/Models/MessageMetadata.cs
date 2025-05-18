@@ -19,6 +19,8 @@
         public string? fromNumber { get; set; }
         public bool IsRead { get; set; } = false;
         public bool HasAttachments { get; set; } = false;
+        public bool IsNew { get; set; } // Added for new messages
+        public bool IsAutoReplied { get; set; } // Added to track auto-replies
 
         // Navigation properties
         public User User { get; set; }
