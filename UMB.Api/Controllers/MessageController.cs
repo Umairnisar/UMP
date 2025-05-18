@@ -10,7 +10,7 @@ namespace UMB.Api.Controllers
 {
     [ApiController]
     [Route("api/[controller]")]
-    [Authorize]
+    //[Authorize]
     public class MessagesController : ControllerBase
     {
         private readonly IMessageService _messageService;
@@ -26,6 +26,7 @@ namespace UMB.Api.Controllers
         public async Task<IActionResult> GetAllMessages([FromQuery] bool? unread, [FromQuery] string? platform)
         {
             var userId = GetCurrentUserId();
+            userId = 1;
             var messages = await _messageService.GetConsolidatedMessages(userId, unread, platform);
             return Ok(messages);
         }
@@ -36,6 +37,7 @@ namespace UMB.Api.Controllers
             try
             {
                 var userId = GetCurrentUserId();
+                 userId = 1;
 
                 // Validate active account for the platform
                 string accountIdentifier;

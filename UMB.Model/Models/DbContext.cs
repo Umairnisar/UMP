@@ -117,7 +117,8 @@ namespace UMB.Model.Models
         {
             var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>();
             // Temporary connection string for design-time (replace with your actual connection string)
-            optionsBuilder.UseSqlServer("Server=77.68.54.17;Database=UnifiedMessagingDb;User ID=sa;Password=gaiweuva$21%aszx(&^;MultipleActiveResultSets=true; TrustServerCertificate=True");
+            optionsBuilder.UseSqlServer("Server=DESKTOP-45662KM\\SQLEXPRESS;Database=SmartHubMessagingDb;User ID=sa;Password=12345;TrustServerCertificate=True");
+            //"DefaultConnection": "Server=DESKTOP-45662KM\\SQLEXPRESS;Database=SmartHubMessagingDb;User=sa;Password=12345;TrustServerCertificate=true;"
 
             return new AppDbContext(optionsBuilder.Options);
         }
