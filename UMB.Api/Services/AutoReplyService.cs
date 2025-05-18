@@ -55,6 +55,9 @@ namespace UMB.Api.Services
             var linkedinService = scope.ServiceProvider.GetRequiredService<ILinkedInIntegrationService>();
             var gmailService = scope.ServiceProvider.GetRequiredService<IGmailIntegrationService>();
             var whatsappService = scope.ServiceProvider.GetRequiredService<IWhatsAppIntegrationService>();
+            var outlookService = scope.ServiceProvider.GetRequiredService<IOutlookIntegrationService>();
+
+
 
             var newMessages = await dbContext.MessageMetadatas
                 .Where(m => m.IsNew && !m.IsAutoReplied && m.From != "You")
@@ -75,6 +78,14 @@ namespace UMB.Api.Services
                                 message.UserId,
                                 recipient, // Assumes recipient is entityUrn
                                 replyText,
+                                message.AccountIdentifier);
+                            break;
+                        case "Outlook":
+                            await outlookService.SendMessageAsync(
+                                message.UserId,
+                                subject,
+                                replyText,
+                                recipient, // Assumes recipient is entityUrn
                                 message.AccountIdentifier);
                             break;
                         case "Gmail":

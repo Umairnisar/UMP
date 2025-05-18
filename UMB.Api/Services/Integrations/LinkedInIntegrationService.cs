@@ -226,7 +226,7 @@ namespace UMB.Api.Services.Integrations
                             From = sender,
                             ReceivedAt = DateTimeOffset.FromUnixTimeMilliseconds(msg.createdAt).UtcDateTime,
                             IsRead = false,
-                            IsNew = false,
+                            IsNew = true,
                             IsAutoReplied = false
                         };
 
