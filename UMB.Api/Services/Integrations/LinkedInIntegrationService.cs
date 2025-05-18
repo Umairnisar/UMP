@@ -225,7 +225,9 @@ namespace UMB.Api.Services.Integrations
                             Body = msg.text,
                             From = sender,
                             ReceivedAt = DateTimeOffset.FromUnixTimeMilliseconds(msg.createdAt).UtcDateTime,
-                            IsRead = false
+                            IsRead = false,
+                            IsNew = false,
+                            IsAutoReplied = false
                         };
 
                         messageMetadataList.Add(messageMetadata);
@@ -245,7 +247,11 @@ namespace UMB.Api.Services.Integrations
 
                     allMessages.AddRange(messageMetadataList);
                 }
-
+             
+                // Reset IsNew for existing messages
+                await _dbContext.MessageMetadatas
+                    .Where(m => m.UserId == userId && m.PlatformType == "LinkedIn" && !allMessages.Select(x => x.ExternalMessageId).Contains(m.ExternalMessageId))
+                    .ExecuteUpdateAsync(setters => setters.SetProperty(m => m.IsNew, false));
                 return allMessages.OrderByDescending(m => m.ReceivedAt).ToList();
             }
             catch (Exception ex)
