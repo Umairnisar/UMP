@@ -93,6 +93,7 @@ namespace UMB.Api.Services.Integrations
                     UserId = userId,
                     PlatformType = "Outlook",
                     AccountIdentifier = accountIdentifier, // e.g., user@outlook.com
+                    ExternalAccountId = "Outlook",
                     CreatedAt = DateTime.UtcNow
                 };
                 _dbContext.PlatformAccounts.Add(account);
@@ -101,7 +102,7 @@ namespace UMB.Api.Services.Integrations
             account.AccessToken = tokenData.access_token;
             account.RefreshToken = tokenData.refresh_token;
             account.TokenExpiresAt = DateTime.UtcNow.AddSeconds(tokenData.expires_in);
-            account.ExternalAccountId = null;
+            account.ExternalAccountId = "ExternalAccountId";
             account.UpdatedAt = DateTime.UtcNow;
 
             await _dbContext.SaveChangesAsync();
