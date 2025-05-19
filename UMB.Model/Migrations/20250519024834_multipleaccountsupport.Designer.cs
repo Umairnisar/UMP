@@ -12,8 +12,8 @@ using UMB.Model.Models;
 namespace UMB.Model.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    [Migration("20250518104725_addcolumn")]
-    partial class addcolumn
+    [Migration("20250519024834_multipleaccountsupport")]
+    partial class multipleaccountsupport
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)

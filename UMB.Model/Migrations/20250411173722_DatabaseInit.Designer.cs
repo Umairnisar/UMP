@@ -12,60 +12,18 @@ using UMB.Model.Models;
 namespace UMB.Model.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    [Migration("20250518091855_AddIsNewAndIsAutoRepliedToMessageMetadata")]
-    partial class AddIsNewAndIsAutoRepliedToMessageMetadata
+    [Migration("20250411173722_DatabaseInit")]
+    partial class DatabaseInit
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
-                .HasAnnotation("ProductVersion", "9.0.4")
+                .HasAnnotation("ProductVersion", "9.0.3")
                 .HasAnnotation("Relational:MaxIdentifierLength", 128);
 
             SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
-
-            modelBuilder.Entity("UMB.Model.Models.MessageAttachment", b =>
-                {
-                    b.Property<int>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("int");
-
-                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
-
-                    b.Property<string>("AttachmentId")
-                        .IsRequired()
-                        .HasMaxLength(500)
-                        .HasColumnType("nvarchar(500)");
-
-                    b.Property<byte[]>("Content")
-                        .HasColumnType("varbinary(max)");
-
-                    b.Property<string>("ContentType")
-                        .IsRequired()
-                        .HasMaxLength(100)
-                        .HasColumnType("nvarchar(100)");
-
-                    b.Property<DateTime>("CreatedAt")
-                        .HasColumnType("datetime2");
-
-                    b.Property<string>("FileName")
-                        .IsRequired()
-                        .HasMaxLength(255)
-                        .HasColumnType("nvarchar(255)");
-
-                    b.Property<int>("MessageMetadataId")
-                        .HasColumnType("int");
-
-                    b.Property<long>("Size")
-                        .HasColumnType("bigint");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("MessageMetadataId");
-
-                    b.ToTable("MessageAttachments");
-                });
 
             modelBuilder.Entity("UMB.Model.Models.MessageMetadata", b =>
                 {
@@ -74,10 +32,6 @@ namespace UMB.Model.Migrations
                         .HasColumnType("int");
 
                     SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
-
-                    b.Property<string>("AccountIdentifier")
-                        .IsRequired()
-                        .HasColumnType("nvarchar(max)");
 
                     b.Property<string>("Body")
                         .HasColumnType("nvarchar(max)");
@@ -90,18 +44,6 @@ namespace UMB.Model.Migrations
 
                     b.Property<string>("FromEmail")
                         .HasColumnType("nvarchar(max)");
-
-                    b.Property<bool>("HasAttachments")
-                        .HasColumnType("bit");
-
-                    b.Property<string>("HtmlBody")
-                        .HasColumnType("nvarchar(max)");
-
-                    b.Property<bool>("IsAutoReplied")
-                        .HasColumnType("bit");
-
-                    b.Property<bool>("IsNew")
-                        .HasColumnType("bit");
 
                     b.Property<bool>("IsRead")
                         .HasColumnType("bit");
@@ -144,35 +86,21 @@ namespace UMB.Model.Migrations
                     SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
 
                     b.Property<string>("AccessToken")
-                        .IsRequired()
                         .HasColumnType("nvarchar(max)");
-
-                    b.Property<string>("AccountIdentifier")
-                        .IsRequired()
-                        .HasColumnType("nvarchar(450)");
-
-                    b.Property<DateTime>("CreatedAt")
-                        .HasColumnType("datetime2");
 
                     b.Property<string>("ExternalAccountId")
-                        .IsRequired()
                         .HasColumnType("nvarchar(max)");
 
-                    b.Property<bool>("IsActive")
-                        .HasColumnType("bit");
+                    b.Property<string>("ExternalBusinessId")
+                        .HasColumnType("nvarchar(max)");
 
                     b.Property<string>("PlatformType")
-                        .IsRequired()
-                        .HasColumnType("nvarchar(450)");
+                        .HasColumnType("nvarchar(max)");
 
                     b.Property<string>("RefreshToken")
-                        .IsRequired()
                         .HasColumnType("nvarchar(max)");
 
                     b.Property<DateTime?>("TokenExpiresAt")
-                        .HasColumnType("datetime2");
-
-                    b.Property<DateTime?>("UpdatedAt")
                         .HasColumnType("datetime2");
 
                     b.Property<int>("UserId")
@@ -180,8 +108,7 @@ namespace UMB.Model.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("UserId", "PlatformType", "AccountIdentifier")
-                        .IsUnique();
+                    b.HasIndex("UserId");
 
                     b.ToTable("PlatformAccounts");
                 });
@@ -293,9 +220,6 @@ namespace UMB.Model.Migrations
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("datetime2");
 
-                    b.Property<bool>("IsActive")
-                        .HasColumnType("bit");
-
                     b.Property<bool>("IsConnected")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("bit")
@@ -321,21 +245,10 @@ namespace UMB.Model.Migrations
 
                     b.HasIndex("PhoneNumberId");
 
-                    b.HasIndex("UserId", "PhoneNumber")
+                    b.HasIndex("UserId")
                         .IsUnique();
 
                     b.ToTable("WhatsAppConnections");
-                });
-
-            modelBuilder.Entity("UMB.Model.Models.MessageAttachment", b =>
-                {
-                    b.HasOne("UMB.Model.Models.MessageMetadata", "Message")
-                        .WithMany("Attachments")
-                        .HasForeignKey("MessageMetadataId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
-
-                    b.Navigation("Message");
                 });
 
             modelBuilder.Entity("UMB.Model.Models.MessageMetadata", b =>
@@ -385,17 +298,12 @@ namespace UMB.Model.Migrations
             modelBuilder.Entity("UMB.Model.Models.WhatsAppConnection", b =>
                 {
                     b.HasOne("UMB.Model.Models.User", "User")
-                        .WithMany()
-                        .HasForeignKey("UserId")
+                        .WithOne()
+                        .HasForeignKey("UMB.Model.Models.WhatsAppConnection", "UserId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
 
                     b.Navigation("User");
-                });
-
-            modelBuilder.Entity("UMB.Model.Models.MessageMetadata", b =>
-                {
-                    b.Navigation("Attachments");
                 });
 
             modelBuilder.Entity("UMB.Model.Models.User", b =>

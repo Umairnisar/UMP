@@ -12,15 +12,15 @@ using UMB.Model.Models;
 namespace UMB.Model.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    [Migration("20250510092229_initial")]
-    partial class initial
+    [Migration("20250510083344_initil")]
+    partial class initil
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
-                .HasAnnotation("ProductVersion", "9.0.4")
+                .HasAnnotation("ProductVersion", "9.0.3")
                 .HasAnnotation("Relational:MaxIdentifierLength", 128);
 
             SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
@@ -74,10 +74,6 @@ namespace UMB.Model.Migrations
                         .HasColumnType("int");
 
                     SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
-
-                    b.Property<string>("AccountIdentifier")
-                        .IsRequired()
-                        .HasColumnType("nvarchar(max)");
 
                     b.Property<string>("Body")
                         .HasColumnType("nvarchar(max)");
@@ -138,35 +134,21 @@ namespace UMB.Model.Migrations
                     SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
 
                     b.Property<string>("AccessToken")
-                        .IsRequired()
                         .HasColumnType("nvarchar(max)");
-
-                    b.Property<string>("AccountIdentifier")
-                        .IsRequired()
-                        .HasColumnType("nvarchar(450)");
-
-                    b.Property<DateTime>("CreatedAt")
-                        .HasColumnType("datetime2");
 
                     b.Property<string>("ExternalAccountId")
-                        .IsRequired()
                         .HasColumnType("nvarchar(max)");
 
-                    b.Property<bool>("IsActive")
-                        .HasColumnType("bit");
+                    b.Property<string>("ExternalBusinessId")
+                        .HasColumnType("nvarchar(max)");
 
                     b.Property<string>("PlatformType")
-                        .IsRequired()
-                        .HasColumnType("nvarchar(450)");
+                        .HasColumnType("nvarchar(max)");
 
                     b.Property<string>("RefreshToken")
-                        .IsRequired()
                         .HasColumnType("nvarchar(max)");
 
                     b.Property<DateTime?>("TokenExpiresAt")
-                        .HasColumnType("datetime2");
-
-                    b.Property<DateTime?>("UpdatedAt")
                         .HasColumnType("datetime2");
 
                     b.Property<int>("UserId")
@@ -174,8 +156,7 @@ namespace UMB.Model.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("UserId", "PlatformType", "AccountIdentifier")
-                        .IsUnique();
+                    b.HasIndex("UserId");
 
                     b.ToTable("PlatformAccounts");
                 });
@@ -287,9 +268,6 @@ namespace UMB.Model.Migrations
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("datetime2");
 
-                    b.Property<bool>("IsActive")
-                        .HasColumnType("bit");
-
                     b.Property<bool>("IsConnected")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("bit")
@@ -315,7 +293,7 @@ namespace UMB.Model.Migrations
 
                     b.HasIndex("PhoneNumberId");
 
-                    b.HasIndex("UserId", "PhoneNumber")
+                    b.HasIndex("UserId")
                         .IsUnique();
 
                     b.ToTable("WhatsAppConnections");
@@ -379,8 +357,8 @@ namespace UMB.Model.Migrations
             modelBuilder.Entity("UMB.Model.Models.WhatsAppConnection", b =>
                 {
                     b.HasOne("UMB.Model.Models.User", "User")
-                        .WithMany()
-                        .HasForeignKey("UserId")
+                        .WithOne()
+                        .HasForeignKey("UMB.Model.Models.WhatsAppConnection", "UserId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
 

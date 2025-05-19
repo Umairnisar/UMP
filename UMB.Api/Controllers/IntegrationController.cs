@@ -65,7 +65,6 @@ namespace UMB.Api.Controllers
         public async Task<IActionResult> GetGmailAccounts()
         {
             var userId = GetCurrentUserId();
-             userId = 1;
             var accounts = await _integrationService.GetUserPlatformsAsync(userId, "Gmail");
             var result = accounts.Select(p => new
             {

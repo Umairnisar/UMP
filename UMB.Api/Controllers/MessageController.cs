@@ -26,7 +26,6 @@ namespace UMB.Api.Controllers
         public async Task<IActionResult> GetAllMessages([FromQuery] bool? unread, [FromQuery] string? platform)
         {
             var userId = GetCurrentUserId();
-            userId = 1;
             var messages = await _messageService.GetConsolidatedMessages(userId, unread, platform);
             return Ok(messages);
         }
