@@ -56,7 +56,7 @@ namespace UMB.Api.Services
             var gmailService = scope.ServiceProvider.GetRequiredService<IGmailIntegrationService>();
             var whatsappService = scope.ServiceProvider.GetRequiredService<IWhatsAppIntegrationService>();
             var outlookService = scope.ServiceProvider.GetRequiredService<IOutlookIntegrationService>();
-
+            var twitterService = scope.ServiceProvider.GetRequiredService<ITwitterIntegrationService>();
 
 
             var newMessages = await dbContext.MessageMetadatas
@@ -99,6 +99,13 @@ namespace UMB.Api.Services
                         case "WhatsApp":
                             await whatsappService.SendMessageAsync(
                                  message.UserId,
+                                recipient,
+                                replyText,
+                                message.AccountIdentifier);
+                            break;
+                        case "Twitter":
+                            await twitterService.SendMessageAsync(
+                                message.UserId,
                                 recipient,
                                 replyText,
                                 message.AccountIdentifier);

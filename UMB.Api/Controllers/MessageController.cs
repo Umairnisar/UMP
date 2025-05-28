@@ -1,9 +1,11 @@
 ﻿using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using System;
 using System.Linq;
 using System.Threading.Tasks;
 using UMB.Api.Services;
+using UMB.Api.Services.Integrations;
 using UMB.Model.Models;
 
 namespace UMB.Api.Controllers
@@ -15,19 +17,76 @@ namespace UMB.Api.Controllers
     {
         private readonly IMessageService _messageService;
         private readonly AppDbContext _dbContext;
+        private readonly ILinkedInIntegrationService _linkedinService;
+        private readonly ITwitterIntegrationService _twitterService;
 
-        public MessagesController(IMessageService messageService, AppDbContext dbContext)
+        public MessagesController(
+            IMessageService messageService,
+            AppDbContext dbContext,
+            ILinkedInIntegrationService linkedinService,
+            ITwitterIntegrationService twitterService)
         {
             _messageService = messageService;
             _dbContext = dbContext;
+            _linkedinService = linkedinService;
+            _twitterService = twitterService;
+        }
+
+        [HttpGet("authorize/{platform}")]
+        public IActionResult GetAuthorizationUrl(string platform, [FromQuery] int userId, [FromQuery] string accountIdentifier)
+        {
+            try
+            {
+                string authUrl = platform.ToLower() switch
+                {
+                    "linkedin" => _linkedinService.GetAuthorizationUrl(userId, accountIdentifier),
+                    "twitter" => _twitterService.GetAuthorizationUrl(userId, accountIdentifier),
+                    _ => throw new ArgumentException($"Authorization not supported for platform: {platform}")
+                };
+                return Ok(new { AuthorizationUrl = authUrl });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest($"Error generating authorization URL: {ex.Message}");
+            }
+        }
+
+        [HttpGet("callback/{platform}")]
+        public async Task<IActionResult> Callback(string platform, [FromQuery] int userId, [FromQuery] string code, [FromQuery] string accountIdentifier, [FromQuery] string state)
+        {
+            try
+            {
+                if (!state.StartsWith($"{userId}|"))
+                    return BadRequest("Invalid state parameter");
+
+                await (platform.ToLower() switch
+                {
+                    "linkedin" => _linkedinService.ExchangeCodeForTokenAsync(userId, code, accountIdentifier),
+                    "twitter" => _twitterService.ExchangeCodeForTokenAsync(userId, code, accountIdentifier),
+                    _ => throw new ArgumentException($"Callback not supported for platform: {platform}")
+                });
+
+                return Ok("Account connected successfully");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error connecting account: {ex.Message}");
+            }
         }
 
         [HttpGet("all")]
         public async Task<IActionResult> GetAllMessages([FromQuery] bool? unread, [FromQuery] string? platform)
         {
-            var userId = GetCurrentUserId();
-            var messages = await _messageService.GetConsolidatedMessages(userId, unread, platform);
-            return Ok(messages);
+            try
+            {
+                var userId = GetCurrentUserId();
+                var messages = await _messageService.GetConsolidatedMessages(userId, unread, platform);
+                return Ok(messages);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error retrieving messages: {ex.Message}");
+            }
         }
 
         [HttpPost("send")]
@@ -36,7 +95,7 @@ namespace UMB.Api.Controllers
             try
             {
                 var userId = GetCurrentUserId();
-                 userId = 1;
+                // userId = 1; // Remove in production
 
                 // Validate active account for the platform
                 string accountIdentifier;
@@ -57,6 +116,7 @@ namespace UMB.Api.Controllers
                     accountIdentifier = activeAccount.AccountIdentifier;
                 }
 
+                // Validate attachments
                 List<IFormFile> attachments = null;
                 if (request.Attachments != null && request.Attachments.Any())
                 {
@@ -129,13 +189,12 @@ namespace UMB.Api.Controllers
         public string Subject { get; set; }
         public string Body { get; set; }
         public string To { get; set; }
-        //public List<IFormFile> Attachments { get; set; }
         public List<IFormFile>? Attachments { get; set; } = new List<IFormFile>();
     }
 
     public class MarkMessageReadRequest
     {
-        public string AccountIdentifier { get; set; } // e.g., user1@gmail.com, profile123, +1234567890
+        public string AccountIdentifier { get; set; }
     }
 
     public class AttachmentDownloadRequest

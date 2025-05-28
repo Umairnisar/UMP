@@ -1,4 +1,5 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -16,19 +17,25 @@ namespace UMB.Api.Services
         private readonly ILinkedInIntegrationService _linkedinIntegration;
         private readonly IOutlookIntegrationService _outlookIntegration;
         private readonly IWhatsAppIntegrationService _whatsAppIntegration;
+        private readonly ITwitterIntegrationService _twitterIntegration;
+        private readonly ILogger<MessageService> _logger;
 
         public MessageService(
             AppDbContext dbContext,
             IGmailIntegrationService gmailIntegration,
             ILinkedInIntegrationService linkedinIntegration,
             IOutlookIntegrationService outlookIntegration,
-            IWhatsAppIntegrationService whatsAppIntegration)
+            IWhatsAppIntegrationService whatsAppIntegration,
+            ITwitterIntegrationService twitterIntegration,
+            ILogger<MessageService> logger)
         {
             _dbContext = dbContext;
             _gmailIntegration = gmailIntegration;
             _linkedinIntegration = linkedinIntegration;
             _outlookIntegration = outlookIntegration;
             _whatsAppIntegration = whatsAppIntegration;
+            _twitterIntegration = twitterIntegration;
+            _logger = logger;
         }
 
         public async Task<List<MessageMetadata>> GetConsolidatedMessages(int userId, bool? unread = null, string platform = null)
@@ -66,10 +73,15 @@ namespace UMB.Api.Services
             if (string.IsNullOrEmpty(platform))
             {
                 platforms.Add("WhatsApp"); // Include WhatsApp if no specific platform is specified
+                platforms.Add("Twitter"); // Include Twitter if no specific platform is specified
             }
             else if (platform.Equals("WhatsApp", StringComparison.OrdinalIgnoreCase))
             {
                 platforms = new List<string> { "WhatsApp" };
+            }
+            else if (platform.Equals("Twitter", StringComparison.OrdinalIgnoreCase))
+            {
+                platforms = new List<string> { "Twitter" };
             }
             else
             {
@@ -94,12 +106,14 @@ namespace UMB.Api.Services
                         case "whatsapp":
                             messages.AddRange(await _whatsAppIntegration.FetchMessagesAsync(userId));
                             break;
+                        case "twitter":
+                            messages.AddRange(await _twitterIntegration.FetchMessagesAsync(userId));
+                            break;
                     }
                 }
                 catch (Exception ex)
                 {
-                    // Log error and continue with other platforms
-                    Console.WriteLine($"Error fetching messages for {plat}: {ex.Message}");
+                    _logger.LogWarning(ex, "Error fetching messages for {Platform} for user {UserId}", plat, userId);
                 }
             }
 
@@ -115,24 +129,41 @@ namespace UMB.Api.Services
 
         public async Task SendMessage(int userId, string platform, string subject, string body, string to, string accountIdentifier, List<IFormFile> attachments = null)
         {
-            switch (platform.ToLower())
+            try
             {
-                case "gmail":
-                    await _gmailIntegration.SendMessageAsync(userId, subject, body, to, accountIdentifier, attachments);
-                    break;
-                case "linkedin":
-                    if (attachments != null && attachments.Any())
-                        throw new ArgumentException("LinkedIn does not support attachments.");
-                    await _linkedinIntegration.SendMessageAsync(userId, to, body, accountIdentifier);
-                    break;
-                case "outlook":
-                    await _outlookIntegration.SendMessageAsync(userId, subject, body, to, accountIdentifier, attachments);
-                    break;
-                case "whatsapp":
-                    await _whatsAppIntegration.SendMessageAsync(userId, to, body, accountIdentifier, attachments);
-                    break;
-                default:
-                    throw new ArgumentException("Unsupported platform.");
+                foreach (var recipient in to)
+                {
+                    switch (platform.ToLower())
+                    {
+                        case "gmail":
+                            await _gmailIntegration.SendMessageAsync(userId, subject, body, to, accountIdentifier, attachments);
+                            break;
+                        case "linkedin":
+                            if (attachments != null && attachments.Any())
+                                throw new InvalidOperationException("LinkedIn does not support attachments.");
+                            await _linkedinIntegration.SendMessageAsync(userId, to, body, accountIdentifier);
+                            break;
+                        case "outlook":
+                            await _outlookIntegration.SendMessageAsync(userId, subject, body, to, accountIdentifier, attachments);
+
+                            break;
+                        case "whatsapp":
+                            await _whatsAppIntegration.SendMessageAsync(userId, to, body, accountIdentifier, attachments);
+                            break;
+                        case "twitter":
+                            if (attachments != null && attachments.Any())
+                                throw new InvalidOperationException("Twitter does not support attachments.");
+                            await _twitterIntegration.SendMessageAsync(userId, to, body, accountIdentifier);
+                            break;
+                        default:
+                            throw new ArgumentException($"Unsupported platform: {platform}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error sending message for user {UserId} on platform {Platform}", userId, platform);
+                throw;
             }
         }
 
@@ -144,22 +175,22 @@ namespace UMB.Api.Services
 
             if (message == null)
             {
-                throw new KeyNotFoundException($"Message with ID {externalMessageId} not found for account {accountIdentifier}.");
+                throw new KeyNotFoundException($"Message with Id {externalMessageId} not found for account {accountIdentifier}.");
             }
 
             message.IsRead = true;
             await _dbContext.SaveChangesAsync();
             return message;
         }
-
         public async Task<(byte[] Content, string ContentType, string FileName)> GetAttachmentAsync(int userId, string messageId, string attachmentId)
+
         {
             var message = await _dbContext.MessageMetadatas
                 .FirstOrDefaultAsync(m => m.UserId == userId && m.ExternalMessageId == messageId);
 
             if (message == null)
             {
-                throw new KeyNotFoundException($"Message with ID {messageId} not found.");
+                throw new KeyNotFoundException($"Message with Id {messageId} not found.");
             }
 
             var platform = message.PlatformType;
@@ -173,6 +204,8 @@ namespace UMB.Api.Services
                     return await _outlookIntegration.GetAttachmentAsync(userId, messageId, attachmentId, accountIdentifier);
                 case "whatsapp":
                     return await _whatsAppIntegration.GetAttachmentAsync(userId, messageId, attachmentId, accountIdentifier);
+                case "twitter":
+                    throw new NotSupportedException("Attachments not supported for Twitter.");
                 default:
                     throw new NotSupportedException($"Attachments not supported for platform {platform}.");
             }
