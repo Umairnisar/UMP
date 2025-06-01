@@ -17,6 +17,7 @@ namespace UMB.Api.Controllers
         private readonly ILinkedInIntegrationService _linkedinIntegration;
         private readonly IOutlookIntegrationService _outlookIntegration;
         private readonly IWhatsAppIntegrationService _whatsAppIntegration;
+        private readonly ITwitterIntegrationService _twitterIntegration;
         private readonly IBaseIntegrationService _integrationService;
         private readonly AppDbContext _appDbContext;
 
@@ -25,6 +26,7 @@ namespace UMB.Api.Controllers
             ILinkedInIntegrationService linkedinIntegration,
             IOutlookIntegrationService outlookIntegration,
             IWhatsAppIntegrationService whatsAppIntegration,
+            ITwitterIntegrationService twitterIntegration,
             IBaseIntegrationService integrationService,
             AppDbContext appDbContext)
         {
@@ -32,6 +34,7 @@ namespace UMB.Api.Controllers
             _linkedinIntegration = linkedinIntegration;
             _outlookIntegration = outlookIntegration;
             _whatsAppIntegration = whatsAppIntegration;
+            _twitterIntegration = twitterIntegration;
             _integrationService = integrationService;
             _appDbContext = appDbContext;
         }
@@ -258,6 +261,62 @@ namespace UMB.Api.Controllers
                 userId = wc.UserId.ToString()
             });
             return Ok(result);
+        }
+
+        [HttpPost("twitter/connect")]
+        public IActionResult ConnectTwitter([FromBody] ConnectAccountRequest request)
+        {
+            if (string.IsNullOrEmpty(request.AccountIdentifier))
+                return BadRequest("AccountIdentifier is required.");
+
+            var userId = GetCurrentUserId();
+            var url = _twitterIntegration.GetAuthorizationUrl(userId, request.AccountIdentifier);
+            return Ok(new { url });
+        }
+
+        [HttpGet("twitter/callback")]
+        public async Task<IActionResult> TwitterCallback([FromQuery] string code, [FromQuery] string state)
+        {
+            var parts = state.Split('|'); // Format: userId|accountIdentifier
+            if (parts.Length != 2)
+                return BadRequest("Invalid state parameter.");
+
+            var userId = int.Parse(parts[0]);
+            var accountIdentifier = parts[1];
+            await _twitterIntegration.ExchangeCodeForTokenAsync(userId, code, accountIdentifier);
+            await SetActiveAccountAsync(userId, "Twitter", accountIdentifier);
+            return Ok("Twitter account connected!");
+        }
+
+        [HttpGet("twitter/accounts")]
+        public async Task<IActionResult> GetTwitterAccounts()
+        {
+            var userId = GetCurrentUserId();
+            var accounts = await _integrationService.GetUserPlatformsAsync(userId, "Twitter");
+            var result = accounts.Select(p => new
+            {
+                id = p.Id.ToString(),
+                accountIdentifier = p.AccountIdentifier,
+                platformType = p.PlatformType,
+                isActive = p.IsActive,
+                isConnected = p.AccessToken != null,
+                userId = p.UserId.ToString()
+            });
+            return Ok(result);
+        }
+
+        [HttpPost("twitter/switch")]
+        public async Task<IActionResult> SwitchTwitterAccount([FromBody] SwitchAccountRequest request)
+        {
+            if (string.IsNullOrEmpty(request.AccountIdentifier))
+                return BadRequest("AccountIdentifier is required.");
+
+            var userId = GetCurrentUserId();
+            var success = await SetActiveAccountAsync(userId, "Twitter", request.AccountIdentifier);
+            if (!success)
+                return NotFound("Account not found or could not be switched.");
+
+            return Ok($"Active Twitter account switched to {request.AccountIdentifier}.");
         }
 
         [HttpGet("platforms")]
